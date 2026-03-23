@@ -13,7 +13,7 @@ import torch
 # set this environment variable to the location of your imagenet directory if you want to read ImageNet data.
 # make sure your val directory is preprocessed to look like the train directory, e.g. by running this script
 # https://raw.githubusercontent.com/soumith/imagenetloader.torch/master/valprep.sh
-os.environ['IMAGENET_LOC_ENV'] = "./image_net"
+os.environ['IMAGENET_LOC_ENV'] = "./dataset/imagenet"
 os.environ['celebA'] = "./datasets/CelebA-HQ"
 
 
@@ -88,7 +88,7 @@ def _imagenet(split: str, adv=False) -> Dataset:
         if split == "train":
             subdir = os.path.join(dir, "train")
             transform = transforms.Compose([
-                transforms.RandomSizedCrop(224),
+                transforms.RandomResizedCrop(224),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor()
             ])

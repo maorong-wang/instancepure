@@ -1,6 +1,10 @@
 # modify on top of https://github.com/xavihart/Diff-PGD
 
-from PIL import ImageFilter
+import os
+import sys
+from pathlib import Path
+
+from PIL import Image, ImageFilter
 from load_dm import get_imagenet_dm_conf
 from dataset import get_dataset
 from utils import *
@@ -9,17 +13,15 @@ import torchvision
 from tqdm.auto import tqdm
 import random
 from archs import get_archs, IMAGENET_MODEL
-from advertorch.attacks import LinfPGDAttack, L2PGDAttack, SpatialTransformAttack
 import matplotlib.pylab as plt
 import time
 import glob
 import pandas as pd
-from attack_tools import gen_pgd_confs
 import torchvision.transforms.functional as TF
 import torch.nn.functional as F
 from torchvision.transforms import Resize, Grayscale, GaussianBlur
-from torchmetrics.image import SSIM, PSNR
-from torcheval.metrics import FrechetInceptionDistance as FID
+# from torchmetrics.image import SSIM, PSNR
+# from torcheval.metrics import FrechetInceptionDistance as FID
 from diffusers import LCMScheduler, TCDScheduler, StableDiffusionControlNetImg2ImgPipeline, ControlNetModel
 from diffusers.utils import *
 from peft import LoraConfig
@@ -27,14 +29,15 @@ from datasets import load_dataset
 import argparse
 from autoattack import AutoAttack
 import cv2
-import lpips
+# import lpips
 from safetensors.torch import load_file
 from peft import get_peft_model_state_dict
-from torch.utils.data import DataLoader
-from dame_recon.purifier import *
-from advex_uar.attacks.snow_attack import *
-from advex_uar.attacks.fog_attack import *
-from advex_uar.attacks.gabor_attack import *
+from torch.utils.data import DataLoader, Subset
+# from dame_recon.purifier import *
+# from advex_uar.attacks.snow_attack import *
+# from advex_uar.attacks.fog_attack import *
+# from advex_uar.attacks.gabor_attack import *
+import foolbox as fb
 
 def parse_args():
     parser = argparse.ArgumentParser(description="choose using LCM/TCD and original/adversarial Lora")
@@ -50,11 +53,77 @@ def parse_args():
     parser.add_argument("--guidance_scale", default=1.0, type=float, help="guidance scale of diffusion model")
     parser.add_argument("--control_scale", default=0.8, type=float, help="control sclae of diffusion model")
     parser.add_argument("--input_image", default="./image_net", type=str, help="input image directory")
-    parser.add_argument("--classifier", default="resnet50", type=str, help="classification model")
+    parser.add_argument(
+        "--classifier",
+        default="resnet50",
+        type=str,
+        help=f"classification model. Available: {', '.join(IMAGENET_MODEL)}",
+    )
     parser.add_argument("--attack_method", default="Linf_pgd", type=str, help="attack model")
-    parser.add_argument("--device", default=0, help="gpu:?")
+    parser.add_argument("--device", default="cuda:0", help="device, e.g. cuda:0")
+    parser.add_argument("--use_ranpac_head", type=str2bool, default=False, help="replace the final linear layer with a RanPAC ridge head")
+    parser.add_argument("--ranpac_rp_dim", type=int, default=5000, help="random projection dimension for RanPAC")
+    parser.add_argument("--ranpac_batch_size", type=int, default=256, help="batch size used to fit the RanPAC head")
+    parser.add_argument("--ranpac_num_workers", type=int, default=8, help="number of workers used to fit the RanPAC head")
+    parser.add_argument("--ranpac_seed", type=int, default=0, help="seed used to build the RanPAC random projection")
+    parser.add_argument("--ranpac_cache_dir", type=str, default="pretrained/ranpac", help="cache directory for fitted RanPAC heads")
+    parser.add_argument("--ranpac_dataset_root", type=str, default=None, help="ImageNet root used when fitting a RanPAC head")
+    parser.add_argument("--stadv_num_iterations", type=int, default=100, help="number of optimization steps for the DiffPure stadv attack")
+    parser.add_argument("--stadv_eot_iter", type=int, default=20, help="EOT iterations for the DiffPure stadv attack")
+    parser.add_argument("--use_wandb", type=str2bool, default=False, help="log final metrics to Weights & Biases")
+    parser.add_argument("--wandb_project", type=str, default="instantpure", help="Weights & Biases project name")
+    parser.add_argument("--wandb_entity", type=str, default="", help="Weights & Biases entity")
+    parser.add_argument("--wandb_name", type=str, default="", help="Weights & Biases run name")
+    parser.add_argument("--wandb_group", type=str, default="", help="Weights & Biases run group")
+    parser.add_argument("--wandb_mode", type=str, default="online", help="Weights & Biases mode: online, offline, or disabled")
+    parser.add_argument("--atk_iter", type=int, default=40, help="")
+    parser.add_argument("--eps", type=int, default=4, help="")
     args = parser.parse_args()
     return args
+
+
+def resolve_device(device):
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, int):
+        return torch.device(f"cuda:{device}")
+    if isinstance(device, str) and device.isdigit():
+        return torch.device(f"cuda:{device}")
+    return torch.device(device)
+
+
+def load_diffpure_stadv_attack():
+    diffpure_root = Path(__file__).resolve().parent.parent / "DiffPure"
+    if not diffpure_root.exists():
+        raise ImportError(f"DiffPure was not found at {diffpure_root}.")
+
+    diffpure_root_str = str(diffpure_root)
+    if diffpure_root_str not in sys.path:
+        sys.path.insert(0, diffpure_root_str)
+
+    from stadv_eot.attacks import StAdvAttack
+
+    return StAdvAttack
+
+
+def gen_pgd_confs(eps, alpha, iter, input_range=(0, 1)):
+    scale = float(input_range[1] - input_range[0]) / 255.0
+    return {
+        "eps": eps * scale,
+        "alpha": alpha * scale,
+        "iter": iter,
+        "input_range": input_range,
+    }
+
+
+def sample_eval_subset(dataset, num_samples, seed):
+    if num_samples >= len(dataset):
+        return dataset
+
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    indices = torch.randperm(len(dataset), generator=generator)[:num_samples].tolist()
+    return Subset(dataset, indices)
 
 def seed_everything(seed=3407):
     random.seed(seed)
@@ -169,36 +238,42 @@ class Denoised_Classifier(torch.nn.Module):
 
 def generate_x_adv(x, y, classifier, pgd_conf, device):
     net = classifier
+
+    def run_foolbox_pgd(attack_cls, eps, abs_stepsize, criterion):
+        fmodel = fb.PyTorchModel(net, bounds=(0, 1), device=device)
+        attack = attack_cls(
+            steps=pgd_conf["iter"],
+            random_start=False,
+            abs_stepsize=abs_stepsize,
+        )
+        _, clipped_advs, _ = attack(fmodel, x, criterion, epsilons=[eps])
+        return clipped_advs[0] if isinstance(clipped_advs, (list, tuple)) else clipped_advs[0]
+
     if args.attack_method == "Linf_pgd":
-        adversary = LinfPGDAttack(net,
-                                  loss_fn=torch.nn.CrossEntropyLoss(reduction="sum"),
-                                  eps=pgd_conf['eps'],
-                                  nb_iter=pgd_conf['iter'],
-                                  eps_iter=pgd_conf['alpha'],
-                                  rand_init=False,
-                                  targeted=False,
-                                  )
-        x_adv = adversary.perturb(x, y)
+        x_adv = run_foolbox_pgd(
+            fb.attacks.LinfPGD,
+            eps=pgd_conf["eps"],
+            abs_stepsize=pgd_conf["alpha"],
+            criterion=y,
+        )
 
     elif args.attack_method == "L2_pgd":
-        adversary = L2PGDAttack(net,
-                                  loss_fn=torch.nn.CrossEntropyLoss(reduction="sum"),
-                                  eps=0.5,
-                                  nb_iter=pgd_conf['iter'],
-                                  eps_iter=0.1,
-                                  rand_init=False,
-                                  targeted=False,
-                                  )
-        x_adv = adversary.perturb(x, y)
+        x_adv = run_foolbox_pgd(
+            fb.attacks.L2PGD,
+            eps=0.5,
+            abs_stepsize=0.1,
+            criterion=y,
+        )
 
     elif args.attack_method == "stadv":
-        adversary = SpatialTransformAttack(net,
-                                  num_classes=1000,
-                                  clip_min=-1.,
-                                  loss_fn=torch.nn.CrossEntropyLoss(reduction="sum"),
-                                  max_iterations=pgd_conf['iter'],
-                                  )
-        x_adv = adversary.perturb(x, y)
+        StAdvAttack = load_diffpure_stadv_attack()
+        adversary = StAdvAttack(
+            net,
+            bound=pgd_conf["eps"],
+            num_iterations=args.stadv_num_iterations,
+            eot_iter=args.stadv_eot_iter,
+        )
+        x_adv = adversary(x, y)
 
     elif args.attack_method == "AutoAttack":
         adversary = AutoAttack(classifier, norm='Linf', eps=pgd_conf["eps"], version='standard', device=device)
@@ -207,15 +282,12 @@ def generate_x_adv(x, y, classifier, pgd_conf, device):
     elif args.attack_method == "target_Linf_pgd":
         label_offset = torch.randint(low=1, high=1000, size=y.shape, generator=None).to(device)
         random_target = torch.remainder(y + label_offset, 1000).to(device)
-        adversary = LinfPGDAttack(net,
-                                  loss_fn=torch.nn.CrossEntropyLoss(reduction="sum"),
-                                  eps=pgd_conf['eps'],
-                                  nb_iter=pgd_conf['iter'],
-                                  eps_iter=pgd_conf['alpha'],
-                                  rand_init=False,
-                                  targeted=True,
-                                  )
-        x_adv = adversary.perturb(x, random_target)
+        x_adv = run_foolbox_pgd(
+            fb.attacks.LinfPGD,
+            eps=pgd_conf["eps"],
+            abs_stepsize=pgd_conf["alpha"],
+            criterion=fb.criteria.TargetedMisclassification(random_target),
+        )
 
     elif args.attack_method == "snow":
         x_adv = SnowAttack(
@@ -269,22 +341,44 @@ def generate_x_adv_denoised_v2(x, y, diffusion, model, classifier, pgd_conf, dev
 
 def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_global', alpha=2, version="v1"):
     pgd_conf = gen_pgd_confs(eps=eps, alpha=alpha, iter=iter, input_range=(0, 1))
-    if args.load_origin_lora:
-        save_path = os.path.join(args.output_dir,
-                                 f"{args.attack_method}/{args.classifier}/{args.model}/origin_lora_1/{args.lora_input_dir}/num_inference_step_{args.num_inference_step}_strength_{int(args.strength * 1000)}_guidance_scale_{args.guidance_scale}_{args.num_validation_set}_control_scale_{args.control_scale}")
-    else:
-        save_path = os.path.join(args.output_dir,
-                                 f"{args.attack_method}/{args.classifier}/{args.model}/{args.lora_input_dir}/num_inference_step_{args.num_inference_step}_strength_{int(args.strength * 1000)}_guidance_scale_{args.guidance_scale}_{args.num_validation_set}_control_scale_{args.control_scale}")
+    device = resolve_device(device)
+    classifier_variant = classifier if not args.use_ranpac_head else f"{classifier}_ranpac"
+    lora_dir = args.lora_input_dir or "no_lora"
 
-    mp(save_path + "/visualization/")
+    if args.load_origin_lora:
+        save_path = os.path.join(
+            args.output_dir,
+            f"{args.attack_method}/{classifier_variant}/{args.model}/origin_lora_1/{lora_dir}/num_inference_step_{args.num_inference_step}_strength_{int(args.strength * 1000)}_guidance_scale_{args.guidance_scale}_{args.num_validation_set}_control_scale_{args.control_scale}",
+        )
+    else:
+        save_path = os.path.join(
+            args.output_dir,
+            f"{args.attack_method}/{classifier_variant}/{args.model}/{lora_dir}/num_inference_step_{args.num_inference_step}_strength_{int(args.strength * 1000)}_guidance_scale_{args.guidance_scale}_{args.num_validation_set}_control_scale_{args.control_scale}",
+        )
+
+    os.makedirs(save_path, exist_ok=True)
+    wandb_run = init_wandb(args, save_path)
     seed_everything(args.seed)
-    classifier = get_archs(classifier, 'imagenet')  
+    classifier = get_archs(
+        classifier,
+        "imagenet",
+        use_ranpac=args.use_ranpac_head,
+        ranpac_rp_dim=args.ranpac_rp_dim,
+        ranpac_batch_size=args.ranpac_batch_size,
+        ranpac_num_workers=args.ranpac_num_workers,
+        ranpac_seed=args.ranpac_seed,
+        ranpac_cache_dir=args.ranpac_cache_dir,
+        ranpac_dataset_root=args.ranpac_dataset_root,
+        device=device,
+    )
     classifier = classifier.to(device)
     classifier.eval()
 
     dataset = get_dataset(
         'imagenet', split='test', adv=False
     )
+    dataset = sample_eval_subset(dataset, args.num_validation_set, args.seed)
+    num_eval_samples = len(dataset)
 
     test_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=8)
 
@@ -338,35 +432,39 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         pipe.load_lora_weights(unwrapped_state_dict)
 
     classifier_accuracy = 0
-    attack_fail_rate = 0
+    original_classifier_robust_accuracy = 0
     robust_accuracy = 0
     clean_accuracy = 0
 
     clean_typical_accuracy = 0
     typical_accuracy = 0
 
-    mp(save_path + "/clean_image/")
-    mp(save_path + "/robust_image/")
-    mp(save_path + "/canny_image/")
-    mp(save_path + "/adversarial_image/")
-    mp(save_path + "/typical_image/")
+    for subdir in (
+        "visualization",
+        "clean_image",
+        "robust_image",
+        "canny_image",
+        "adversarial_image",
+        "typical_image",
+    ):
+        os.makedirs(os.path.join(save_path, subdir), exist_ok=True)
     
     i = 1
 
-    for x, y in test_loader:
-        if i > args.num_validation_set:
-            break
-
+    for x, y in tqdm(test_loader):
         x, y = x.to(device), y.to(device)
 
         classifier_accuracy += (y == classifier(x).argmax(1)).sum().item()
 
-        if version == 'v1':
-            x_adv = generate_x_adv(x, y, classifier, pgd_conf, device)            #pgd
-        elif version == 'v2':
-            x_adv = generate_x_adv_denoised_v2(x, y, diffusion, model, classifier, pgd_conf, device, t, pipe)     #diff-pgd
+        x_adv_classifier = generate_x_adv(x, y, classifier, pgd_conf, device)
+        original_classifier_robust_accuracy += (y == classifier(x_adv_classifier).argmax(1)).sum().item()
 
-        attack_fail_rate += (y == classifier(x_adv).argmax(1)).sum().item()
+        if version == 'v1':
+            x_adv = x_adv_classifier
+        elif version == 'v2':
+            x_adv = generate_x_adv_denoised_v2(x, y, diffusion, model, classifier, pgd_conf, device, t, pipe)
+        else:
+            raise NotImplementedError(f"Unknown attack version: {version}")
 
         with (torch.no_grad()):
             net = Denoised_Classifier(classifier, pipe, device, diffusion, model, t)
@@ -382,21 +480,28 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         robust_accuracy += (y == classifier(robust_x.to(torch.float32)).argmax(1)).sum().item()
         i += 1
 
-    stat = {
-        "classifier_accuracy": classifier_accuracy / args.num_validation_set,
-        "attack_fail_rate": attack_fail_rate/ args.num_validation_set,
-        "clean_accuracy": clean_accuracy / args.num_validation_set,
-        "robust_accuracy": robust_accuracy / args.num_validation_set,
-        "clean_typical_accuracy": clean_typical_accuracy / args.num_validation_set,
-        "typical_accuracy": typical_accuracy / args.num_validation_set,
+    metrics = {
+        "classifier_accuracy": classifier_accuracy / num_eval_samples,
+        "original_classifier_robust_accuracy": original_classifier_robust_accuracy / num_eval_samples,
+        "attack_fail_rate": original_classifier_robust_accuracy / num_eval_samples,
+        "clean_accuracy": clean_accuracy / num_eval_samples,
+        "robust_accuracy": robust_accuracy / num_eval_samples,
+        "clean_typical_accuracy": clean_typical_accuracy / num_eval_samples,
+        "typical_accuracy": typical_accuracy / num_eval_samples,
+        "evaluated_examples": i - 1,
     }
 
-    stat = pd.DataFrame(stat, index=[0])
-    stat.to_csv(save_path + f'stat.csv')
+    stat = pd.DataFrame(metrics, index=[0])
+    stat.to_csv(os.path.join(save_path, "stat.csv"), index=False)
+
+    if wandb_run is not None:
+        wandb_run.summary["save_path"] = save_path
+        log_wandb_metrics(wandb_run, metrics)
+        finish_wandb(wandb_run)
 
     print(stat)
 
 if __name__ == '__main__':
     args = parse_args()
-    Global(args.classifier, args.device, 'ddim50', t=150, eps=4, iter=1, name='attack_global_gradpass', alpha=1,                     #4/255 pgd-100 if want to run autoattack 4/255 just run this and add args.attack_method=AutoAttack
+    Global(args.classifier, args.device, 'ddim50', t=150, eps=args.eps, iter=args.atk_iter, name='attack_global_gradpass', alpha=1,                     #4/255 pgd-100 if want to run autoattack 4/255 just run this and add args.attack_method=AutoAttack
                 args=args, version="v1")

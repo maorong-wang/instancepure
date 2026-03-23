@@ -1,0 +1,312 @@
+import os
+
+from tqdm.auto import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Subset
+
+
+class RanPACLinear(nn.Module):
+    def __init__(self, in_features, out_features, rp_dim, weight, w_rand):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rp_dim = rp_dim
+        self.register_buffer("weight", weight)
+        self.register_buffer("w_rand", w_rand)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        projected = F.relu(x @ self.w_rand)
+        return projected @ self.weight.t()
+
+
+def _get_module_by_name(model, module_name):
+    module = model
+    for attr in module_name.split("."):
+        module = getattr(module, attr)
+    return module
+
+
+def _set_module_by_name(model, module_name, new_module):
+    parts = module_name.split(".")
+    parent = model
+    for attr in parts[:-1]:
+        parent = getattr(parent, attr)
+    setattr(parent, parts[-1], new_module)
+
+
+def _find_last_linear(model):
+    linear_modules = [(name, module) for name, module in model.named_modules() if isinstance(module, nn.Linear)]
+    if not linear_modules:
+        raise ValueError("RanPAC requires a model with a final nn.Linear layer.")
+    return linear_modules[-1]
+
+
+def _resolve_imagenet_train_dir(dataset_root):
+    candidates = []
+    if dataset_root:
+        candidates.extend(
+            [
+                dataset_root,
+                os.path.join(dataset_root, "imagenet"),
+                os.path.join(dataset_root, "image_net"),
+            ]
+        )
+
+    env_root = os.environ.get("IMAGENET_LOC_ENV")
+    if env_root:
+        candidates.append(env_root)
+
+    candidates.extend(["./image_net", "./dataset/imagenet"])
+
+    for root in candidates:
+        if not root:
+            continue
+        if os.path.basename(root.rstrip("/")) == "train" and os.path.isdir(root):
+            return root
+
+        train_dir = os.path.join(root, "train")
+        if os.path.isdir(train_dir):
+            return train_dir
+
+    raise FileNotFoundError(
+        "Could not locate the ImageNet train directory. Set IMAGENET_LOC_ENV or pass --ranpac_dataset_root."
+    )
+
+
+def _build_imagenet_train_loaders(dataset_root, batch_size, num_workers):
+    train_dir = _resolve_imagenet_train_dir(dataset_root)
+    transform = transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+        ]
+    )
+    dataset = torchvision.datasets.ImageFolder(train_dir, transform=transform)
+    train_cutoff = int(len(dataset) * 0.8)
+    train_subset = Subset(dataset, range(train_cutoff))
+    val_subset = Subset(dataset, range(train_cutoff, len(dataset)))
+
+    common_kwargs = dict(
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=torch.cuda.is_available(),
+        num_workers=num_workers,
+    )
+    return (
+        DataLoader(train_subset, **common_kwargs),
+        DataLoader(val_subset, **common_kwargs),
+    )
+
+
+def _build_train_loaders(classifier_name, dataset_root, batch_size, num_workers):
+    if "imagenet" in classifier_name:
+        return _build_imagenet_train_loaders(dataset_root, batch_size, num_workers)
+    raise NotImplementedError(f"RanPAC train loader is not implemented for {classifier_name}.")
+
+
+def _accumulate_statistics(model, linear_layer, loader, w_rand, out_features, device, description):
+    feature_buffer = []
+
+    def hook(_, inputs):
+        feature_buffer.append(inputs[0].detach())
+
+    handle = linear_layer.register_forward_pre_hook(hook)
+    g_matrix = torch.zeros(w_rand.size(1), w_rand.size(1), dtype=torch.float32)
+    q_matrix = torch.zeros(w_rand.size(1), out_features, dtype=torch.float32)
+    target_norm = 0.0
+    sample_count = 0
+
+    try:
+        with torch.no_grad():
+            for inputs, targets in tqdm(loader, desc=description):
+                inputs = inputs.to(device)
+                targets = targets.to(device)
+                feature_buffer.clear()
+                _ = model(inputs)
+                features = feature_buffer.pop().view(inputs.size(0), -1).cpu()
+                projected = F.relu(features @ w_rand)
+                onehot = F.one_hot(targets.cpu(), num_classes=out_features).float()
+
+                g_matrix += projected.t() @ projected
+                q_matrix += projected.t() @ onehot
+                target_norm += onehot.square().sum().item()
+                sample_count += onehot.size(0)
+    finally:
+        handle.remove()
+
+    return g_matrix, q_matrix, target_norm, sample_count
+
+
+def _optimise_ridge_parameter(g_train, q_train, g_val, q_val, val_target_norm, num_classes, val_sample_count, device):
+    ridges = [10.0 ** power for power in range(-8, 9)]
+    if val_sample_count == 0:
+        return ridges[0]
+
+    g_train = g_train.to(device)
+    q_train = q_train.to(device)
+    g_val = g_val.to(device)
+    q_val = q_val.to(device)
+    eye = torch.eye(g_train.size(0), device=device, dtype=g_train.dtype)
+
+    best_ridge = ridges[0]
+    best_loss = None
+    denominator = max(val_sample_count * num_classes, 1)
+
+    with torch.no_grad():
+        for ridge in ridges:
+            weights = torch.linalg.solve(g_train + ridge * eye, q_train).t()
+            quadratic = torch.trace(weights @ g_val @ weights.t())
+            cross_term = torch.trace(weights @ q_val)
+            loss = (quadratic - 2.0 * cross_term + val_target_norm) / denominator
+            loss_value = loss.item()
+            if best_loss is None or loss_value < best_loss:
+                best_loss = loss_value
+                best_ridge = ridge
+
+    return best_ridge
+
+
+def _fit_ranpac_state(
+    model,
+    classifier_name,
+    dataset_root,
+    cache_path,
+    rp_dim,
+    batch_size,
+    num_workers,
+    seed,
+    device,
+    train_loader=None,
+    val_loader=None,
+):
+    layer_name, linear_layer = _find_last_linear(model)
+    in_features = linear_layer.in_features
+    out_features = linear_layer.out_features
+    if train_loader is None:
+        train_loader, val_loader = _build_train_loaders(classifier_name, dataset_root, batch_size, num_workers)
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    w_rand = torch.randn(in_features, rp_dim, generator=generator, dtype=torch.float32)
+
+    model = model.eval().to(device)
+    print(f"Fitting RanPAC head for {cache_path}...")
+    g_train, q_train, _, _ = _accumulate_statistics(
+        model,
+        linear_layer,
+        train_loader,
+        w_rand,
+        out_features,
+        device,
+        description="RanPAC train stats",
+    )
+    if val_loader is not None:
+        g_val, q_val, val_target_norm, val_sample_count = _accumulate_statistics(
+            model,
+            linear_layer,
+            val_loader,
+            w_rand,
+            out_features,
+            device,
+            description="RanPAC val stats",
+        )
+    else:
+        g_val = torch.zeros_like(g_train)
+        q_val = torch.zeros_like(q_train)
+        val_target_norm = 0.0
+        val_sample_count = 0
+
+    ridge = _optimise_ridge_parameter(
+        g_train,
+        q_train,
+        g_val,
+        q_val,
+        val_target_norm,
+        out_features,
+        val_sample_count,
+        device,
+    )
+    print(f"RanPAC optimal ridge: {ridge}")
+
+    g_full = (g_train + g_val).to(device)
+    q_full = (q_train + q_val).to(device)
+    eye = torch.eye(g_full.size(0), device=device, dtype=g_full.dtype)
+    weights = torch.linalg.solve(g_full + ridge * eye, q_full).t().cpu()
+
+    state = {
+        "layer_name": layer_name,
+        "in_features": in_features,
+        "out_features": out_features,
+        "rp_dim": rp_dim,
+        "ridge": ridge,
+        "w_rand": w_rand,
+        "weight": weights,
+    }
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    torch.save(state, cache_path)
+    return state
+
+
+def apply_ranpac_head(
+    model,
+    classifier_name,
+    dataset_root=None,
+    rp_dim=5000,
+    batch_size=256,
+    num_workers=4,
+    seed=0,
+    device=None,
+    cache_dir="pretrained/ranpac",
+    train_loader=None,
+    val_loader=None,
+):
+    if train_loader is None and "imagenet" not in classifier_name:
+        raise NotImplementedError("RanPAC head replacement is currently implemented for ImageNet classifiers only.")
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
+
+    cache_name = f"{classifier_name.replace('/', '_')}_rp{rp_dim}_seed{seed}.pt"
+    cache_path = os.path.join(cache_dir, cache_name)
+
+    layer_name, linear_layer = _find_last_linear(model)
+    if os.path.exists(cache_path):
+        state = torch.load(cache_path, map_location="cpu")
+    else:
+        state = _fit_ranpac_state(
+            model,
+            classifier_name=classifier_name,
+            dataset_root=dataset_root,
+            cache_path=cache_path,
+            rp_dim=rp_dim,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            seed=seed,
+            device=device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+        )
+
+    if state["layer_name"] != layer_name:
+        raise ValueError(f"Cached RanPAC head expects layer {state['layer_name']} but found {layer_name}.")
+    if state["in_features"] != linear_layer.in_features or state["out_features"] != linear_layer.out_features:
+        raise ValueError("Cached RanPAC head does not match the pretrained classifier dimensions.")
+
+    ranpac_head = RanPACLinear(
+        in_features=state["in_features"],
+        out_features=state["out_features"],
+        rp_dim=state["rp_dim"],
+        weight=state["weight"],
+        w_rand=state["w_rand"],
+    )
+    _set_module_by_name(model, layer_name, ranpac_head)
+    return model

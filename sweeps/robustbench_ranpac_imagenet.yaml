@@ -1,0 +1,62 @@
+program: eval_robustbench_ranpac.py
+method: grid
+project: robustbench-ranpac
+name: robustbench-ranpac-imagenet
+metric:
+  name: robust_acc
+  goal: maximize
+parameters:
+  dataset:
+    value: imagenet
+  threat_model:
+    value: Linf
+  data_dir:
+    value: ./dataset/imagenet
+  model_dir:
+    value: ./robustbench_models
+  model_names:
+    values:
+      - Xu2024MIMIR_Swin-L
+  use_ranpac:
+    values: [false, true]
+  attack_method:
+    values: [pgd, autoattack]
+  eval_examples:
+    value: 1000
+  eval_split:
+    value: test
+  eval_batch_size:
+    value: 64
+  num_workers:
+    value: 4
+  eps:
+    value: 0.0156862745
+  pgd_steps:
+    value: 40
+  pgd_random_start:
+    value: true
+  autoattack_version:
+    value: rand
+  ranpac_rp_dim:
+    value: 10000
+  ranpac_fit_batch_size:
+    value: 256
+  ranpac_cache_dir:
+    value: pretrained/ranpac_robustbench
+  seed:
+    value: 0
+  device:
+    value: cuda:0
+  use_wandb:
+    value: true
+  wandb_project:
+    value: robustbench-ranpac
+  wandb_group:
+    value: robustbench-ranpac-imagenet
+  wandb_mode:
+    value: online
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args}

@@ -1,5 +1,7 @@
 export MODEL_NAME="stable-diffusion-v1-5/stable-diffusion-v1-5"
 export OUTPUT_DIR="./logs/OSCP"
+export REPORT_TO="${REPORT_TO:-tensorboard}"
+export TRACKER_PROJECT_NAME="${TRACKER_PROJECT_NAME:-OCSP-LoRA}"
 
 accelerate launch train_lora.py \
     --pretrained_teacher_model=$MODEL_NAME \
@@ -19,5 +21,6 @@ accelerate launch train_lora.py \
     --use_8bit_adam \
     --lr_scheduler="constant_with_warmup" \
     --resume_from_checkpoint=latest \
-    --report_to="tensorboard" \
+    --report_to="$REPORT_TO" \
+    --tracker_project_name="$TRACKER_PROJECT_NAME" \
     --seed=3407

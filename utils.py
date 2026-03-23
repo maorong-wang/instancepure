@@ -1,14 +1,16 @@
 # modify on top of https://github.com/xavihart/Diff-PGD
 
-import torch
-import numpy as np
-import torchvision
-from colorama import Fore, Back, Style
+import argparse
 import os
-import torchvision.transforms as transforms
-from PIL import Image
-import glob
 import random
+
+import numpy as np
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from colorama import Fore, Back, Style
+from PIL import Image
+
 from ddim_solver import extract_into_tensor
 
 
@@ -39,6 +41,53 @@ def cprint(x, c):
         c_t = Fore.YELLOW
     print(c_t, x)
     print(Style.RESET_ALL)
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    if v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
+def init_wandb(args, log_dir):
+    if not getattr(args, "use_wandb", False):
+        return None
+
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError(
+            "wandb is not installed. Install it in the active environment or run with --use_wandb false."
+        ) from exc
+
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity or None,
+        name=args.wandb_name or None,
+        group=args.wandb_group or None,
+        mode=args.wandb_mode,
+        dir=log_dir,
+        config=vars(args),
+        reinit=True,
+    )
+
+
+def log_wandb_metrics(run, metrics):
+    if run is None:
+        return
+
+    run.log(metrics)
+    for key, value in metrics.items():
+        run.summary[key] = value
+
+
+def finish_wandb(run):
+    if run is not None:
+        run.finish()
 
 def si(x, p, to_01=False, normalize=False):
     if isinstance(x, np.ndarray):
