@@ -32,6 +32,7 @@ from autoattack import AutoAttack
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
+from classifiers.hira import apply_hira_adaptation
 from classifiers.ranpac import apply_ranpac_head
 from dataset import get_dataset as instantpure_get_dataset
 
@@ -67,6 +68,13 @@ def str2bool(v):
     if value in {"no", "false", "f", "n", "0"}:
         return False
     raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
+def _format_cache_value(value):
+    text = str(value)
+    for old, new in (("/", "_"), (" ", ""), (".", "p"), ("-", "m")):
+        text = text.replace(old, new)
+    return text
 
 
 def parse_args():
@@ -120,6 +128,24 @@ def parse_args():
     parser.add_argument("--pgd-step-size", "--pgd_step_size", type=float, default=None, help="PGD step size. Defaults to 2 * eps / steps.")
     parser.add_argument("--pgd-random-start", "--pgd_random_start", type=str2bool, default=False, help="Enable random-start PGD.")
     parser.add_argument("--autoattack-version", "--autoattack_version", default="standard", help="AutoAttack version.")
+    parser.add_argument(
+        "--use-hira",
+        "--use_hira",
+        type=str2bool,
+        default=None,
+        help="If set, evaluate only the original model (false) or only the HiRA model (true).",
+    )
+    parser.add_argument("--hira-expansion-dim", "--hira_expansion_dim", type=int, default=4096, help="Hidden expansion dimension for HiRA adapters.")
+    parser.add_argument("--hira-batch-size", "--hira_batch_size", type=int, default=32, help="HiRA fitting batch size.")
+    parser.add_argument("--hira-num-workers", "--hira_num_workers", type=int, default=4, help="HiRA fitting DataLoader workers.")
+    parser.add_argument("--hira-epochs", "--hira_epochs", type=int, default=1, help="Number of epochs used to fine-tune HiRA.")
+    parser.add_argument("--hira-lr", "--hira_lr", type=float, default=1e-4, help="Learning rate used to fine-tune HiRA.")
+    parser.add_argument("--hira-weight-decay", "--hira_weight_decay", type=float, default=1e-4, help="Weight decay used to fine-tune HiRA.")
+    parser.add_argument("--hira-seed", "--hira_seed", type=int, default=0, help="Seed used to fine-tune and cache HiRA.")
+    parser.add_argument("--hira-cache-dir", "--hira_cache_dir", default="pretrained/hira_robustbench", help="HiRA cache directory.")
+    parser.add_argument("--hira-dataset-root", "--hira_dataset_root", default="", help="Optional ImageNet root used to fine-tune HiRA. Defaults to --data-dir.")
+    parser.add_argument("--hira-max-train-samples", "--hira_max_train_samples", type=int, default=-1, help="Optional cap on ImageNet train samples used to fine-tune HiRA.")
+    parser.add_argument("--hira-force-retrain", "--hira_force_retrain", type=str2bool, default=False, help="Ignore cached HiRA weights and fine-tune again.")
     parser.add_argument(
         "--use-ranpac",
         "--use_ranpac",
@@ -421,10 +447,40 @@ def resolve_attacks(args):
     return {attack.strip().lower() for attack in args.attacks.split(",") if attack.strip()}
 
 
+def build_hira_variant_name(base_name, args):
+    sample_tag = "full" if args.hira_max_train_samples is None or args.hira_max_train_samples < 0 else str(args.hira_max_train_samples)
+    return (
+        f"{base_name}-hira"
+        f"-exp{args.hira_expansion_dim}"
+        f"-ep{args.hira_epochs}"
+        f"-lr{_format_cache_value(args.hira_lr)}"
+        f"-wd{_format_cache_value(args.hira_weight_decay)}"
+        f"-ns{sample_tag}"
+        f"-seed{args.hira_seed}"
+    )
+
+
 def resolve_variants(args):
-    if args.use_ranpac is None:
-        return ["original", "ranpac"]
-    return ["ranpac"] if args.use_ranpac else ["original"]
+    hira_values = [False, True] if args.use_hira is None else [args.use_hira]
+    ranpac_values = [False, True] if args.use_ranpac is None else [args.use_ranpac]
+    variant_order = {
+        (False, False): "original",
+        (True, False): "hira",
+        (False, True): "ranpac",
+        (True, True): "hira_ranpac",
+    }
+    variants = []
+    for use_hira in hira_values:
+        for use_ranpac in ranpac_values:
+            variants.append(
+                {
+                    "variant": variant_order[(use_hira, use_ranpac)],
+                    "use_hira": use_hira,
+                    "use_ranpac": use_ranpac,
+                }
+            )
+    variants.sort(key=lambda item: list(variant_order.values()).index(item["variant"]))
+    return variants
 
 
 def main():
@@ -436,6 +492,9 @@ def main():
     attacks = resolve_attacks(args)
     variants = resolve_variants(args)
     wandb_run = init_wandb(args)
+
+    if any(variant["use_hira"] for variant in variants) and args.dataset != BenchmarkDataset.imagenet.value:
+        raise NotImplementedError("HiRA evaluation is currently implemented only for ImageNet RobustBench models.")
 
     try:
         results = []
@@ -455,7 +514,7 @@ def main():
             )
             eval_examples = len(eval_loader.dataset)
 
-            for variant in variants:
+            for variant_cfg in variants:
                 model = load_robustbench_model(
                     model_name=model_name,
                     dataset=args.dataset,
@@ -463,8 +522,26 @@ def main():
                     model_dir=args.model_dir,
                     device=device,
                 )
-                if variant == "ranpac":
-                    classifier_name = f"{args.dataset}_{args.threat_model}_{model_name}"
+                classifier_name = f"{args.dataset}_{args.threat_model}_{model_name}"
+                if variant_cfg["use_hira"]:
+                    model = apply_hira_adaptation(
+                        model,
+                        classifier_name=classifier_name,
+                        dataset_root=args.hira_dataset_root or args.data_dir,
+                        expansion_dim=args.hira_expansion_dim,
+                        batch_size=args.hira_batch_size,
+                        num_workers=args.hira_num_workers,
+                        epochs=args.hira_epochs,
+                        lr=args.hira_lr,
+                        weight_decay=args.hira_weight_decay,
+                        seed=args.hira_seed,
+                        device=device,
+                        cache_dir=args.hira_cache_dir,
+                        max_train_samples=args.hira_max_train_samples,
+                        force_retrain=args.hira_force_retrain,
+                    ).to(device).eval()
+                    classifier_name = build_hira_variant_name(classifier_name, args)
+                if variant_cfg["use_ranpac"]:
                     model = apply_ranpac_head(
                         model,
                         classifier_name=classifier_name,
@@ -479,7 +556,7 @@ def main():
 
                 metrics = evaluate_variant(
                     model,
-                    variant_name=variant,
+                    variant_name=variant_cfg["variant"],
                     loader=eval_loader,
                     attacks=attacks,
                     args=args,
@@ -495,7 +572,8 @@ def main():
                         "eps": eps,
                         "eval_examples": eval_examples,
                         "attack_method": args.attack_method or args.attacks,
-                        "use_ranpac": variant == "ranpac",
+                        "use_hira": variant_cfg["use_hira"],
+                        "use_ranpac": variant_cfg["use_ranpac"],
                     }
                 )
                 results.append(metrics)

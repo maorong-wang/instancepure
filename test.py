@@ -59,6 +59,18 @@ def parse_args():
         type=str,
         help=f"classification model. Available: {', '.join(IMAGENET_MODEL)}",
     )
+    parser.add_argument("--use_hira_adapter", type=str2bool, default=False, help="attach HiRA adapters to the last two transformer blocks of ViT-family backbones")
+    parser.add_argument("--hira_expansion_dim", type=int, default=4096, help="hidden expansion dimension for HiRA adapters")
+    parser.add_argument("--hira_batch_size", type=int, default=32, help="batch size used to fine-tune HiRA weights")
+    parser.add_argument("--hira_num_workers", type=int, default=8, help="number of workers used to fine-tune HiRA weights")
+    parser.add_argument("--hira_epochs", type=int, default=1, help="number of epochs used to fine-tune HiRA weights")
+    parser.add_argument("--hira_lr", type=float, default=1e-4, help="learning rate used to fine-tune HiRA weights")
+    parser.add_argument("--hira_weight_decay", type=float, default=1e-4, help="weight decay used to fine-tune HiRA weights")
+    parser.add_argument("--hira_seed", type=int, default=0, help="seed used for HiRA fine-tuning and caching")
+    parser.add_argument("--hira_cache_dir", type=str, default="pretrained/hira", help="cache directory for fine-tuned HiRA weights")
+    parser.add_argument("--hira_dataset_root", type=str, default=None, help="ImageNet root used when fine-tuning HiRA weights")
+    parser.add_argument("--hira_max_train_samples", type=int, default=-1, help="optional cap on ImageNet train samples used to fine-tune HiRA")
+    parser.add_argument("--hira_force_retrain", type=str2bool, default=False, help="ignore cached HiRA weights and fine-tune again")
     parser.add_argument("--attack_method", default="Linf_pgd", type=str, help="attack model")
     parser.add_argument("--device", default="cuda:0", help="device, e.g. cuda:0")
     parser.add_argument("--use_ranpac_head", type=str2bool, default=False, help="replace the final linear layer with a RanPAC ridge head")
@@ -342,7 +354,11 @@ def generate_x_adv_denoised_v2(x, y, diffusion, model, classifier, pgd_conf, dev
 def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_global', alpha=2, version="v1"):
     pgd_conf = gen_pgd_confs(eps=eps, alpha=alpha, iter=iter, input_range=(0, 1))
     device = resolve_device(device)
-    classifier_variant = classifier if not args.use_ranpac_head else f"{classifier}_ranpac"
+    classifier_variant = classifier
+    if args.use_hira_adapter:
+        classifier_variant = f"{classifier_variant}_hira"
+    if args.use_ranpac_head:
+        classifier_variant = f"{classifier_variant}_ranpac"
     lora_dir = args.lora_input_dir or "no_lora"
 
     if args.load_origin_lora:
@@ -362,6 +378,18 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
     classifier = get_archs(
         classifier,
         "imagenet",
+        use_hira=args.use_hira_adapter,
+        hira_expansion_dim=args.hira_expansion_dim,
+        hira_batch_size=args.hira_batch_size,
+        hira_num_workers=args.hira_num_workers,
+        hira_epochs=args.hira_epochs,
+        hira_lr=args.hira_lr,
+        hira_weight_decay=args.hira_weight_decay,
+        hira_seed=args.hira_seed,
+        hira_cache_dir=args.hira_cache_dir,
+        hira_dataset_root=args.hira_dataset_root,
+        hira_max_train_samples=args.hira_max_train_samples,
+        hira_force_retrain=args.hira_force_retrain,
         use_ranpac=args.use_ranpac_head,
         ranpac_rp_dim=args.ranpac_rp_dim,
         ranpac_batch_size=args.ranpac_batch_size,

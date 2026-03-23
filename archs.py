@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torchvision
 
+from classifiers.hira import apply_hira_adaptation
 from classifiers.ranpac import apply_ranpac_head
 
 
@@ -134,9 +135,49 @@ def _default_ranpac_root(dataset):
     return None
 
 
+def _default_hira_root(dataset):
+    return _default_ranpac_root(dataset)
+
+
+def _supports_hira(arch):
+    return arch.startswith("vit_") or arch.startswith("swin_")
+
+
+def _format_cache_value(value):
+    text = str(value)
+    for old, new in (("/", "_"), (" ", ""), (".", "p"), ("-", "m")):
+        text = text.replace(old, new)
+    return text
+
+
+def _build_hira_variant_name(base_name, expansion_dim, epochs, lr, weight_decay, max_train_samples, seed):
+    sample_tag = "full" if max_train_samples is None or max_train_samples < 0 else str(max_train_samples)
+    return (
+        f"{base_name}-hira"
+        f"-exp{expansion_dim}"
+        f"-ep{epochs}"
+        f"-lr{_format_cache_value(lr)}"
+        f"-wd{_format_cache_value(weight_decay)}"
+        f"-ns{sample_tag}"
+        f"-seed{seed}"
+    )
+
+
 def get_archs(
     arch,
     dataset="imagenet",
+    use_hira=False,
+    hira_expansion_dim=4096,
+    hira_batch_size=32,
+    hira_num_workers=4,
+    hira_epochs=1,
+    hira_lr=1e-4,
+    hira_weight_decay=1e-4,
+    hira_seed=0,
+    hira_cache_dir="pretrained/hira",
+    hira_dataset_root=None,
+    hira_max_train_samples=-1,
+    hira_force_retrain=False,
     use_ranpac=False,
     ranpac_rp_dim=5000,
     ranpac_batch_size=256,
@@ -152,9 +193,38 @@ def get_archs(
     canonical_arch = _resolve_imagenet_arch(arch)
     model, mean, std = _build_imagenet_classifier(canonical_arch)
     classifier = NormalizedImageClassifier(model, mean=mean, std=std)
+    classifier_name = f"{dataset}-{canonical_arch.replace('_', '-')}"
+
+    if use_hira:
+        if not _supports_hira(canonical_arch):
+            raise ValueError(f"HiRA is only supported for ViT-family backbones, but got '{canonical_arch}'.")
+        classifier = apply_hira_adaptation(
+            classifier,
+            classifier_name=classifier_name,
+            dataset_root=hira_dataset_root or _default_hira_root(dataset),
+            expansion_dim=hira_expansion_dim,
+            batch_size=hira_batch_size,
+            num_workers=hira_num_workers,
+            epochs=hira_epochs,
+            lr=hira_lr,
+            weight_decay=hira_weight_decay,
+            seed=hira_seed,
+            device=device,
+            cache_dir=hira_cache_dir,
+            max_train_samples=hira_max_train_samples,
+            force_retrain=hira_force_retrain,
+        )
+        classifier_name = _build_hira_variant_name(
+            classifier_name,
+            expansion_dim=hira_expansion_dim,
+            epochs=hira_epochs,
+            lr=hira_lr,
+            weight_decay=hira_weight_decay,
+            max_train_samples=hira_max_train_samples,
+            seed=hira_seed,
+        )
 
     if use_ranpac:
-        classifier_name = f"{dataset}-{canonical_arch.replace('_', '-')}"
         classifier = apply_ranpac_head(
             classifier,
             classifier_name=classifier_name,

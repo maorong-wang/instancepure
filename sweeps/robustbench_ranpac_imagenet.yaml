@@ -1,7 +1,7 @@
 program: eval_robustbench_ranpac.py
 method: grid
 project: robustbench-ranpac
-name: robustbench-ranpac-imagenet
+name: robustbench-ranpac-hira-imagenet
 metric:
   name: robust_acc
   goal: maximize
@@ -17,8 +17,10 @@ parameters:
   model_names:
     values:
       - Xu2024MIMIR_Swin-L
+  use_hira:
+    values: [true, false]
   use_ranpac:
-    values: [false, true]
+    values: [true, false]
   attack_method:
     values: [pgd, autoattack]
   eval_examples:
@@ -37,6 +39,28 @@ parameters:
     value: true
   autoattack_version:
     value: rand
+  hira_expansion_dim:
+    value: 4096
+  hira_batch_size:
+    value: 32
+  hira_num_workers:
+    value: 4
+  hira_epochs:
+    value: 1
+  hira_lr:
+    value: 0.0001
+  hira_weight_decay:
+    value: 0.0001
+  hira_seed:
+    value: 0
+  hira_cache_dir:
+    value: pretrained/hira_robustbench
+  hira_dataset_root:
+    value: ./dataset/imagenet
+  hira_max_train_samples:
+    value: -1
+  hira_force_retrain:
+    value: false
   ranpac_rp_dim:
     value: 10000
   ranpac_fit_batch_size:
@@ -52,7 +76,7 @@ parameters:
   wandb_project:
     value: robustbench-ranpac
   wandb_group:
-    value: robustbench-ranpac-imagenet
+    value: robustbench-ranpac-hira-imagenet
   wandb_mode:
     value: online
 command:
