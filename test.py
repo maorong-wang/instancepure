@@ -78,6 +78,13 @@ def parse_args():
     parser.add_argument("--ranpac_batch_size", type=int, default=256, help="batch size used to fit the RanPAC head")
     parser.add_argument("--ranpac_num_workers", type=int, default=8, help="number of workers used to fit the RanPAC head")
     parser.add_argument("--ranpac_seed", type=int, default=0, help="seed used to build the RanPAC random projection")
+    parser.add_argument(
+        "--ranpac_selection_method",
+        type=str,
+        choices=["regression", "val_acc"],
+        default="regression",
+        help="which cached RanPAC head to apply after fitting both ridge-selection variants",
+    )
     parser.add_argument("--ranpac_cache_dir", type=str, default="pretrained/ranpac", help="cache directory for fitted RanPAC heads")
     parser.add_argument("--ranpac_dataset_root", type=str, default=None, help="ImageNet root used when fitting a RanPAC head")
     parser.add_argument("--stadv_num_iterations", type=int, default=100, help="number of optimization steps for the DiffPure stadv attack")
@@ -358,7 +365,7 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
     if args.use_hira_adapter:
         classifier_variant = f"{classifier_variant}_hira"
     if args.use_ranpac_head:
-        classifier_variant = f"{classifier_variant}_ranpac"
+        classifier_variant = f"{classifier_variant}_ranpac_{args.ranpac_selection_method}"
     lora_dir = args.lora_input_dir or "no_lora"
 
     if args.load_origin_lora:
@@ -395,6 +402,7 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         ranpac_batch_size=args.ranpac_batch_size,
         ranpac_num_workers=args.ranpac_num_workers,
         ranpac_seed=args.ranpac_seed,
+        ranpac_selection_method=args.ranpac_selection_method,
         ranpac_cache_dir=args.ranpac_cache_dir,
         ranpac_dataset_root=args.ranpac_dataset_root,
         device=device,

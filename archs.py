@@ -153,7 +153,7 @@ def _format_cache_value(value):
 def _build_hira_variant_name(base_name, expansion_dim, epochs, lr, weight_decay, max_train_samples, seed):
     sample_tag = "full" if max_train_samples is None or max_train_samples < 0 else str(max_train_samples)
     return (
-        f"{base_name}-hira"
+        f"{base_name}-hira-v10-mlp-residual-randact"
         f"-exp{expansion_dim}"
         f"-ep{epochs}"
         f"-lr{_format_cache_value(lr)}"
@@ -183,6 +183,7 @@ def get_archs(
     ranpac_batch_size=256,
     ranpac_num_workers=4,
     ranpac_seed=0,
+    ranpac_selection_method="regression",
     ranpac_cache_dir="pretrained/ranpac",
     ranpac_dataset_root=None,
     device=None,
@@ -233,6 +234,7 @@ def get_archs(
             batch_size=ranpac_batch_size,
             num_workers=ranpac_num_workers,
             seed=ranpac_seed,
+            selection_method=ranpac_selection_method,
             device=device,
             cache_dir=ranpac_cache_dir,
         )

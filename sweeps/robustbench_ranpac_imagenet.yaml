@@ -16,7 +16,7 @@ parameters:
     value: ./robustbench_models
   model_names:
     values:
-      - Xu2024MIMIR_Swin-L
+      - Xu2024MIMIR_Swin-B
   use_hira:
     values: [true, false]
   use_ranpac:
@@ -28,7 +28,7 @@ parameters:
   eval_split:
     value: test
   eval_batch_size:
-    value: 64
+    value: 128
   num_workers:
     value: 4
   eps:
@@ -40,9 +40,9 @@ parameters:
   autoattack_version:
     value: rand
   hira_expansion_dim:
-    value: 4096
+    value: 8192
   hira_batch_size:
-    value: 32
+    value: 64
   hira_num_workers:
     value: 4
   hira_epochs:

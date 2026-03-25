@@ -1,3 +1,5 @@
+import copy
+import math
 import os
 import random
 
@@ -5,7 +7,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
@@ -14,42 +15,53 @@ from dataset import get_dataset
 
 def _format_cache_value(value):
     text = str(value)
-    for old, new in (("/", "_"), (" ", ""), (".", "p"), ("-", "m")):
+    for old, new in ("/", "_"), (" ", ""), (".", "p"), ("-", "m"):
         text = text.replace(old, new)
     return text
+
+
+HIRA_ACTIVATION_POOL = ("relu", "gelu", "silu", "leaky_relu")
+
+
+def _apply_random_activation(x):
+    if x.is_cuda:
+        activation_index = int(torch.randint(len(HIRA_ACTIVATION_POOL), (), device=x.device).item())
+    else:
+        activation_index = int(torch.randint(len(HIRA_ACTIVATION_POOL), ()).item())
+    activation_name = HIRA_ACTIVATION_POOL[activation_index]
+    if activation_name == "relu":
+        return F.relu(x)
+    if activation_name == "gelu":
+        return F.gelu(x)
+    if activation_name == "silu":
+        return F.silu(x)
+    return F.leaky_relu(x, negative_slope=0.01)
 
 
 class HiRAAdapter(nn.Module):
     def __init__(self, in_features, out_features, expansion_dim):
         super().__init__()
-        self.expand = nn.Linear(in_features, expansion_dim, bias=False)
-        self.reduce = nn.Linear(expansion_dim, out_features, bias=False)
-        nn.init.kaiming_uniform_(self.expand.weight, a=0.0, nonlinearity="relu")
-        nn.init.kaiming_uniform_(self.reduce.weight, a=0.0, nonlinearity="relu")
+        self.register_buffer("b_rand", torch.randn(in_features, expansion_dim, dtype=torch.float32))
+        self.a_weight = nn.Parameter(torch.empty(out_features, expansion_dim))
+        nn.init.kaiming_uniform_(self.a_weight, a=0.0, nonlinearity="relu")
 
     def forward(self, x):
-        return self.reduce(F.relu(self.expand(x)))
+        token_shape = x.shape[:-1]
+        token_features = x.reshape(-1, x.shape[-1]).float()
+        projected = token_features @ self.b_rand
+        projected = _apply_random_activation(projected / math.sqrt(self.b_rand.shape[0]))
+        output = projected @ self.a_weight.float().t()
+        return output.to(x.dtype).reshape(*token_shape, self.a_weight.shape[0])
 
 
-class HiRAQKVWrapper(nn.Module):
-    def __init__(self, base_linear, expansion_dim):
+class HiRAMlpWrapper(nn.Module):
+    def __init__(self, base_mlp, embed_dim, expansion_dim):
         super().__init__()
-        if base_linear.out_features % 3 != 0:
-            raise ValueError("HiRA requires qkv out_features to be divisible by 3.")
+        self.base_mlp = base_mlp
+        self.mlp_adapter = HiRAAdapter(embed_dim, embed_dim, expansion_dim)
 
-        chunk_dim = base_linear.out_features // 3
-        self.base_linear = base_linear
-        self.q_adapter = HiRAAdapter(base_linear.in_features, chunk_dim, expansion_dim)
-        self.k_adapter = HiRAAdapter(base_linear.in_features, chunk_dim, expansion_dim)
-        self.v_adapter = HiRAAdapter(base_linear.in_features, chunk_dim, expansion_dim)
-
-    def forward(self, x):
-        qkv = self.base_linear(x)
-        q_base, k_base, v_base = qkv.chunk(3, dim=-1)
-        q = q_base + self.q_adapter(x)
-        k = k_base + self.k_adapter(x)
-        v = v_base + self.v_adapter(x)
-        return torch.cat((q, k, v), dim=-1)
+    def forward(self, x, *args, **kwargs):
+        return self.base_mlp(x, *args, **kwargs) + self.mlp_adapter(x)
 
 
 def _get_module_by_name(model, module_name):
@@ -67,26 +79,38 @@ def _set_module_by_name(model, module_name, new_module):
     setattr(parent, parts[-1], new_module)
 
 
-def _list_qkv_modules(model):
+def _list_mlp_modules(model):
     return [
-        name
+        (name, module)
         for name, module in model.named_modules()
-        if name.endswith("attn.qkv") and isinstance(module, nn.Linear)
+        if name.endswith(".mlp")
     ]
 
 
-def _attach_hira_modules(model, expansion_dim):
-    qkv_module_names = _list_qkv_modules(model)
-    if len(qkv_module_names) < 2:
-        raise ValueError("HiRA requires a transformer backbone with at least two attention qkv layers.")
-
-    target_module_names = qkv_module_names[-2:]
-    for module_name in target_module_names:
-        module = _get_module_by_name(model, module_name)
-        if isinstance(module, HiRAQKVWrapper):
+def _infer_mlp_embed_dim(module):
+    for attr_path in ("fc1.in_features", "fc2.out_features"):
+        try:
+            candidate = _get_module_by_name(module, attr_path)
+        except AttributeError:
             continue
-        _set_module_by_name(model, module_name, HiRAQKVWrapper(module, expansion_dim))
-    return target_module_names
+        if isinstance(candidate, int):
+            return candidate
+    raise ValueError("Unable to infer MLP embed dimension for HiRA attachment.")
+
+
+def _attach_hira_modules(model, expansion_dim):
+    mlp_modules = _list_mlp_modules(model)
+    if len(mlp_modules) < 2:
+        raise ValueError("HiRA requires a transformer backbone with at least two MLP layers.")
+
+    target_mlp_names = []
+    for module_name, module in mlp_modules[-2:]:
+        if isinstance(module, HiRAMlpWrapper):
+            target_mlp_names.append(module_name)
+            continue
+        _set_module_by_name(model, module_name, HiRAMlpWrapper(module, _infer_mlp_embed_dim(module), expansion_dim))
+        target_mlp_names.append(module_name)
+    return target_mlp_names
 
 
 def _find_last_linear_module_names(model):
@@ -116,14 +140,13 @@ def _freeze_model(model):
         parameter.requires_grad = False
 
 
-def _mark_trainable(model, qkv_module_names):
+def _mark_trainable(model, mlp_module_names):
     _freeze_model(model)
 
-    for qkv_module_name in qkv_module_names[-2:]:
-        wrapper = _get_module_by_name(model, qkv_module_name)
-        for adapter_name in ("q_adapter", "k_adapter", "v_adapter"):
-            for parameter in getattr(wrapper, adapter_name).parameters():
-                parameter.requires_grad = True
+    for mlp_module_name in mlp_module_names[-2:]:
+        wrapper = _get_module_by_name(model, mlp_module_name)
+        for parameter in wrapper.mlp_adapter.parameters():
+            parameter.requires_grad = True
 
     for module_name in _find_classifier_module_names(model):
         module = _get_module_by_name(model, module_name)
@@ -131,16 +154,20 @@ def _mark_trainable(model, qkv_module_names):
             parameter.requires_grad = True
 
 
-def _trainable_state_dict(model):
+def _cached_hira_state_dict(model):
     trainable_keys = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
     state_dict = model.state_dict()
-    return {name: tensor.detach().cpu() for name, tensor in state_dict.items() if name in trainable_keys}
+    return {
+        name: tensor.detach().cpu()
+        for name, tensor in state_dict.items()
+        if name in trainable_keys or name.endswith(".b_rand")
+    }
 
 
 def _build_cache_name(classifier_name, expansion_dim, epochs, lr, weight_decay, max_train_samples, seed):
     sample_tag = "full" if max_train_samples is None or max_train_samples < 0 else str(max_train_samples)
     return (
-        f"{classifier_name.replace('/', '_')}_hira_v2"
+        f"{classifier_name.replace('/', '_')}_hira_v10_mlp_residual_randact"
         f"_exp{expansion_dim}"
         f"_ep{epochs}"
         f"_lr{_format_cache_value(lr)}"
@@ -181,44 +208,56 @@ def _build_train_loader(dataset_root, batch_size, num_workers, seed, max_train_s
     )
 
 
-def _fit_hira_weights(model, loader, device, epochs, lr, weight_decay):
+def _kl_distillation_loss(student_logits, teacher_logits, temperature=1.0):
+    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+    return F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature ** 2)
+
+
+def _fit_hira_weights(model, teacher_model, loader, device, epochs, lr, weight_decay, grad_clip_norm=1.0):
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not trainable_parameters:
         raise ValueError("HiRA did not mark any parameters as trainable.")
 
     optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
-    scaler = GradScaler(enabled=device.type == "cuda")
-    use_amp = device.type == "cuda"
-    model = model.to(device)
+    model = model.to(device).eval()
+    teacher_model = teacher_model.to(device).eval()
+    for parameter in teacher_model.parameters():
+        parameter.requires_grad = False
 
     for epoch in range(epochs):
-        model.train()
         running_loss = 0.0
-        running_correct = 0
         sample_count = 0
 
         progress = tqdm(loader, desc=f"HiRA fine-tune {epoch + 1}/{epochs}")
-        for inputs, targets in progress:
+        for inputs, _ in progress:
             inputs = inputs.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast(enabled=use_amp):
-                logits = model(inputs)
-                loss = F.cross_entropy(logits, targets)
+            logits = model(inputs).float()
+            with torch.no_grad():
+                teacher_logits = teacher_model(inputs).float()
+            loss = _kl_distillation_loss(logits, teacher_logits)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    "Non-finite HiRA loss detected. "
+                    "The MLP HiRA projection is diverging; try a smaller --hira-lr or --hira-expansion-dim."
+                )
 
-            batch_size = targets.size(0)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, grad_clip_norm)
+            if not torch.isfinite(grad_norm):
+                raise FloatingPointError(
+                    "Non-finite HiRA gradient norm detected. "
+                    "The MLP HiRA projection is numerically unstable."
+                )
+            optimizer.step()
+
+            batch_size = inputs.size(0)
             running_loss += loss.item() * batch_size
-            running_correct += (logits.detach().argmax(dim=1) == targets).sum().item()
             sample_count += batch_size
-            progress.set_postfix(
-                loss=f"{running_loss / max(sample_count, 1):.4f}",
-                acc=f"{running_correct / max(sample_count, 1):.4f}",
-            )
+            progress.set_postfix(loss=f"{running_loss / max(sample_count, 1):.4f}")
 
     model.eval()
     return model
@@ -234,6 +273,7 @@ def apply_hira_adaptation(
     epochs=1,
     lr=1e-4,
     weight_decay=1e-4,
+    grad_clip_norm=1.0,
     seed=0,
     device=None,
     cache_dir="pretrained/hira",
@@ -245,8 +285,10 @@ def apply_hira_adaptation(
     else:
         device = torch.device(device)
 
-    qkv_module_names = _attach_hira_modules(model, expansion_dim)
-    _mark_trainable(model, qkv_module_names)
+    teacher_model = copy.deepcopy(model).eval()
+    _seed_everything(seed)
+    mlp_module_names = _attach_hira_modules(model, expansion_dim)
+    _mark_trainable(model, mlp_module_names)
 
     os.makedirs(cache_dir, exist_ok=True)
     cache_path = os.path.join(
@@ -256,12 +298,11 @@ def apply_hira_adaptation(
 
     if os.path.exists(cache_path) and not force_retrain:
         state = torch.load(cache_path, map_location="cpu")
-        model.load_state_dict(state["trainable_state"], strict=False)
+        model.load_state_dict(state["hira_state"], strict=False)
         return model.eval()
 
-    _seed_everything(seed)
     loader = _build_train_loader(dataset_root, batch_size, num_workers, seed, max_train_samples)
-    _fit_hira_weights(model, loader, device, epochs, lr, weight_decay)
+    _fit_hira_weights(model, teacher_model, loader, device, epochs, lr, weight_decay, grad_clip_norm=grad_clip_norm)
 
     state = {
         "classifier_name": classifier_name,
@@ -269,10 +310,23 @@ def apply_hira_adaptation(
         "epochs": epochs,
         "lr": lr,
         "weight_decay": weight_decay,
+        "grad_clip_norm": grad_clip_norm,
         "max_train_samples": max_train_samples,
         "seed": seed,
-        "qkv_module_names": qkv_module_names,
-        "trainable_state": _trainable_state_dict(model),
+        "mlp_module_names": mlp_module_names,
+        "loss_type": "teacher_kl",
+        "headwise_randomization": False,
+        "frozen_b": True,
+        "normalized_random_projection": True,
+        "forward_dtype": "float32",
+        "value_only": False,
+        "token_projection": False,
+        "mlp_projection": True,
+        "mlp_residual": True,
+        "random_activation_pool": list(HIRA_ACTIVATION_POOL),
+        "insert_before_last_blocks": 0,
+        "insert_on_last_blocks_mlp": 2,
+        "hira_state": _cached_hira_state_dict(model),
     }
     torch.save(state, cache_path)
     return model.eval()

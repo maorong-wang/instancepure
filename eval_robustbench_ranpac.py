@@ -161,6 +161,13 @@ def parse_args():
         default=256,
         help="RanPAC fitting batch size.",
     )
+    parser.add_argument(
+        "--ranpac-selection-method",
+        "--ranpac_selection_method",
+        choices=["regression", "val_acc", "both"],
+        default="both",
+        help="Which cached RanPAC head(s) to evaluate after fitting both ridge-selection variants.",
+    )
     parser.add_argument("--ranpac-cache-dir", "--ranpac_cache_dir", default="pretrained/ranpac_robustbench", help="RanPAC cache directory.")
     parser.add_argument("--output-path", "--output_path", default="", help="Optional JSON output path.")
     parser.add_argument("--use-wandb", "--use_wandb", type=str2bool, default=False, help="Log evaluation metrics to Weights & Biases.")
@@ -450,7 +457,7 @@ def resolve_attacks(args):
 def build_hira_variant_name(base_name, args):
     sample_tag = "full" if args.hira_max_train_samples is None or args.hira_max_train_samples < 0 else str(args.hira_max_train_samples)
     return (
-        f"{base_name}-hira"
+        f"{base_name}-hira-v10-mlp-residual-randact"
         f"-exp{args.hira_expansion_dim}"
         f"-ep{args.hira_epochs}"
         f"-lr{_format_cache_value(args.hira_lr)}"
@@ -463,23 +470,34 @@ def build_hira_variant_name(base_name, args):
 def resolve_variants(args):
     hira_values = [False, True] if args.use_hira is None else [args.use_hira]
     ranpac_values = [False, True] if args.use_ranpac is None else [args.use_ranpac]
-    variant_order = {
-        (False, False): "original",
-        (True, False): "hira",
-        (False, True): "ranpac",
-        (True, True): "hira_ranpac",
-    }
+    ranpac_methods = ["regression", "val_acc"] if args.ranpac_selection_method == "both" else [args.ranpac_selection_method]
+    variant_order = [
+        "original",
+        "hira",
+        "ranpac_regression",
+        "ranpac_val_acc",
+        "hira_ranpac_regression",
+        "hira_ranpac_val_acc",
+    ]
     variants = []
     for use_hira in hira_values:
         for use_ranpac in ranpac_values:
-            variants.append(
-                {
-                    "variant": variant_order[(use_hira, use_ranpac)],
-                    "use_hira": use_hira,
-                    "use_ranpac": use_ranpac,
-                }
-            )
-    variants.sort(key=lambda item: list(variant_order.values()).index(item["variant"]))
+            selection_methods = ranpac_methods if use_ranpac else [None]
+            for ranpac_selection_method in selection_methods:
+                if not use_ranpac:
+                    variant = "hira" if use_hira else "original"
+                else:
+                    base_name = "hira_ranpac" if use_hira else "ranpac"
+                    variant = f"{base_name}_{ranpac_selection_method}"
+                variants.append(
+                    {
+                        "variant": variant,
+                        "use_hira": use_hira,
+                        "use_ranpac": use_ranpac,
+                        "ranpac_selection_method": ranpac_selection_method,
+                    }
+                )
+    variants.sort(key=lambda item: variant_order.index(item["variant"]))
     return variants
 
 
@@ -550,6 +568,7 @@ def main():
                         batch_size=args.ranpac_fit_batch_size,
                         num_workers=args.num_workers,
                         seed=args.seed,
+                        selection_method=variant_cfg["ranpac_selection_method"],
                         device=device,
                         cache_dir=args.ranpac_cache_dir,
                     ).to(device).eval()
@@ -574,6 +593,7 @@ def main():
                         "attack_method": args.attack_method or args.attacks,
                         "use_hira": variant_cfg["use_hira"],
                         "use_ranpac": variant_cfg["use_ranpac"],
+                        "ranpac_selection_method": variant_cfg["ranpac_selection_method"],
                     }
                 )
                 results.append(metrics)
