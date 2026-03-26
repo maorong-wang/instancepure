@@ -24,7 +24,7 @@ class RanPACLinear(nn.Module):
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
-        projected = F.relu(x @ self.w_rand)
+        projected = F.gelu(x @ self.w_rand)
         return projected @ self.weight.t()
 
 
@@ -137,7 +137,7 @@ def _accumulate_statistics(model, linear_layer, loader, w_rand, out_features, de
                 feature_buffer.clear()
                 _ = model(inputs)
                 features = feature_buffer.pop().view(inputs.size(0), -1).cpu()
-                projected = F.relu(features @ w_rand)
+                projected = F.gelu(features @ w_rand)
                 onehot = F.one_hot(targets.cpu(), num_classes=out_features).float()
 
                 g_matrix += projected.t() @ projected
@@ -180,7 +180,15 @@ def _compute_candidate_weights(g_train, q_train, g_val, q_val, val_target_norm, 
     return weights_by_ridge, best_ridge, best_loss
 
 
-def _optimise_ridge_by_validation_accuracy(model, linear_layer, loader, w_rand, weights_by_ridge, device, description):
+def _optimise_ridge_by_validation_accuracy(
+    model,
+    linear_layer,
+    loader,
+    w_rand,
+    weights_by_ridge,
+    device,
+    description,
+):
     candidate_ridges = list(weights_by_ridge.keys())
     if loader is None or not candidate_ridges:
         return RIDGE_CANDIDATES[0], None
@@ -202,7 +210,7 @@ def _optimise_ridge_by_validation_accuracy(model, linear_layer, loader, w_rand, 
                 feature_buffer.clear()
                 _ = model(inputs)
                 features = feature_buffer.pop().view(inputs.size(0), -1).cpu()
-                projected = F.relu(features @ w_rand)
+                projected = F.gelu(features @ w_rand)
 
                 for ridge in candidate_ridges:
                     weight = weights_by_ridge[ridge]
@@ -297,10 +305,8 @@ def _fit_ranpac_state(
     if val_acc is not None:
         print(f"RanPAC best val accuracy: {val_acc:.6f}")
 
-    g_full = g_train + g_val
-    q_full = q_train + q_val
-    g_full = g_full.to(device)
-    q_full = q_full.to(device)
+    g_full = (g_train + g_val).to(device)
+    q_full = (q_train + q_val).to(device)
     eye = torch.eye(g_full.size(0), device=device, dtype=g_full.dtype)
 
     selected_heads = {}

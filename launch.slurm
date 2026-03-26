@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH -p gpu
+#SBATCH -p long
 #SBATCH -J dfp 
 #SBATCH -o dfp_%j.out
 #SBATCH --nodes=1
-#SBATCH --nodelist=elab-gpu-ubuntu04
+#SBATCH --nodelist=elab-gpu-ubuntu06
 #SBATCH --ntasks=8
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=4
@@ -13,7 +13,7 @@
 source /home_fmg/maorong/miniconda3/etc/profile.d/conda.sh
 conda activate diffpure 
 
-SWEEP_ID="maorong-wang/robustbench-ranpac/zvq9nfch"
+SWEEP_ID="maorong-wang/robustbench-ranpac-hira-gelu/tmntqprd"
 
 echo "Starting 8 W&B agents with srun"
 echo "Job ID: $SLURM_JOB_ID"

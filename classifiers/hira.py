@@ -20,7 +20,7 @@ def _format_cache_value(value):
     return text
 
 
-HIRA_ACTIVATION_POOL = ("relu", "gelu", "silu", "leaky_relu")
+HIRA_ACTIVATION_POOL = ("gelu")
 
 
 def _apply_random_activation(x):
