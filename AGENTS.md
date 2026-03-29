@@ -17,3 +17,6 @@ Recent history uses short imperative subjects like `Update train_lora.py` and `A
 
 ## Configuration Tips
 Dataset paths default to local folders in `dataset.py` such as `./image_net`; avoid committing machine-specific path changes. Keep secrets, private dataset locations, and large checkpoints out of version control.
+
+## Current Research Notes
+Shared working idea: robustness gains may come from injecting large random projections while preserving the base backbone. Treat RanPAC as the reference head. For HiRA experiments, prefer ViT-family MLP residual adapters on the last `hira_num_blocks` transformer blocks (default `2`) with fixed Gaussian `B`, trainable `A`, and KL-only tuning of `{all A matrices, classifier}` against the original victim model. Do not switch HiRA `B` or RanPAC `W_rand` to block-orthogonal initialization unless explicitly revisiting that ablation.

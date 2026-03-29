@@ -98,13 +98,20 @@ def _infer_mlp_embed_dim(module):
     raise ValueError("Unable to infer MLP embed dimension for HiRA attachment.")
 
 
-def _attach_hira_modules(model, expansion_dim):
+def _resolve_target_mlp_modules(model, num_adapter_blocks):
     mlp_modules = _list_mlp_modules(model)
-    if len(mlp_modules) < 2:
-        raise ValueError("HiRA requires a transformer backbone with at least two MLP layers.")
+    if num_adapter_blocks <= 0:
+        raise ValueError("HiRA requires --hira_num_blocks to be a positive integer.")
+    if len(mlp_modules) < num_adapter_blocks:
+        raise ValueError(
+            f"HiRA requested {num_adapter_blocks} adapter blocks, but the backbone only exposes {len(mlp_modules)} MLP blocks."
+        )
+    return mlp_modules[-num_adapter_blocks:]
 
+
+def _attach_hira_modules(model, expansion_dim, num_adapter_blocks):
     target_mlp_names = []
-    for module_name, module in mlp_modules[-2:]:
+    for module_name, module in _resolve_target_mlp_modules(model, num_adapter_blocks):
         if isinstance(module, HiRAMlpWrapper):
             target_mlp_names.append(module_name)
             continue
@@ -143,7 +150,7 @@ def _freeze_model(model):
 def _mark_trainable(model, mlp_module_names):
     _freeze_model(model)
 
-    for mlp_module_name in mlp_module_names[-2:]:
+    for mlp_module_name in mlp_module_names:
         wrapper = _get_module_by_name(model, mlp_module_name)
         for parameter in wrapper.mlp_adapter.parameters():
             parameter.requires_grad = True
@@ -164,10 +171,17 @@ def _cached_hira_state_dict(model):
     }
 
 
-def _build_cache_name(classifier_name, expansion_dim, epochs, lr, weight_decay, max_train_samples, seed):
+def _format_block_tag(num_adapter_blocks, prefix):
+    if num_adapter_blocks == 2:
+        return ""
+    return f"{prefix}{num_adapter_blocks}"
+
+
+def _build_cache_name(classifier_name, expansion_dim, epochs, lr, weight_decay, max_train_samples, seed, num_adapter_blocks):
     sample_tag = "full" if max_train_samples is None or max_train_samples < 0 else str(max_train_samples)
+    block_tag = _format_block_tag(num_adapter_blocks, "_blk")
     return (
-        f"{classifier_name.replace('/', '_')}_hira_v10_mlp_residual_randact"
+        f"{classifier_name.replace('/', '_')}_hira_v10_mlp_residual_randact{block_tag}"
         f"_exp{expansion_dim}"
         f"_ep{epochs}"
         f"_lr{_format_cache_value(lr)}"
@@ -268,6 +282,7 @@ def apply_hira_adaptation(
     classifier_name,
     dataset_root=None,
     expansion_dim=4096,
+    num_adapter_blocks=2,
     batch_size=32,
     num_workers=4,
     epochs=1,
@@ -287,13 +302,22 @@ def apply_hira_adaptation(
 
     teacher_model = copy.deepcopy(model).eval()
     _seed_everything(seed)
-    mlp_module_names = _attach_hira_modules(model, expansion_dim)
+    mlp_module_names = _attach_hira_modules(model, expansion_dim, num_adapter_blocks)
     _mark_trainable(model, mlp_module_names)
 
     os.makedirs(cache_dir, exist_ok=True)
     cache_path = os.path.join(
         cache_dir,
-        _build_cache_name(classifier_name, expansion_dim, epochs, lr, weight_decay, max_train_samples, seed),
+        _build_cache_name(
+            classifier_name,
+            expansion_dim,
+            epochs,
+            lr,
+            weight_decay,
+            max_train_samples,
+            seed,
+            num_adapter_blocks,
+        ),
     )
 
     if os.path.exists(cache_path) and not force_retrain:
@@ -313,6 +337,7 @@ def apply_hira_adaptation(
         "grad_clip_norm": grad_clip_norm,
         "max_train_samples": max_train_samples,
         "seed": seed,
+        "num_adapter_blocks": num_adapter_blocks,
         "mlp_module_names": mlp_module_names,
         "loss_type": "teacher_kl",
         "headwise_randomization": False,
@@ -325,7 +350,7 @@ def apply_hira_adaptation(
         "mlp_residual": True,
         "random_activation_pool": list(HIRA_ACTIVATION_POOL),
         "insert_before_last_blocks": 0,
-        "insert_on_last_blocks_mlp": 2,
+        "insert_on_last_blocks_mlp": num_adapter_blocks,
         "hira_state": _cached_hira_state_dict(model),
     }
     torch.save(state, cache_path)

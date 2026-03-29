@@ -150,10 +150,11 @@ def _format_cache_value(value):
     return text
 
 
-def _build_hira_variant_name(base_name, expansion_dim, epochs, lr, weight_decay, max_train_samples, seed):
+def _build_hira_variant_name(base_name, expansion_dim, epochs, lr, weight_decay, max_train_samples, seed, num_adapter_blocks):
     sample_tag = "full" if max_train_samples is None or max_train_samples < 0 else str(max_train_samples)
+    block_tag = "" if num_adapter_blocks == 2 else f"-blk{num_adapter_blocks}"
     return (
-        f"{base_name}-hira-v10-mlp-residual-randact"
+        f"{base_name}-hira-v10-mlp-residual-randact{block_tag}"
         f"-exp{expansion_dim}"
         f"-ep{epochs}"
         f"-lr{_format_cache_value(lr)}"
@@ -168,6 +169,7 @@ def get_archs(
     dataset="imagenet",
     use_hira=False,
     hira_expansion_dim=4096,
+    hira_num_blocks=2,
     hira_batch_size=32,
     hira_num_workers=4,
     hira_epochs=1,
@@ -204,6 +206,7 @@ def get_archs(
             classifier_name=classifier_name,
             dataset_root=hira_dataset_root or _default_hira_root(dataset),
             expansion_dim=hira_expansion_dim,
+            num_adapter_blocks=hira_num_blocks,
             batch_size=hira_batch_size,
             num_workers=hira_num_workers,
             epochs=hira_epochs,
@@ -223,6 +226,7 @@ def get_archs(
             weight_decay=hira_weight_decay,
             max_train_samples=hira_max_train_samples,
             seed=hira_seed,
+            num_adapter_blocks=hira_num_blocks,
         )
 
     if use_ranpac:

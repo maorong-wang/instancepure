@@ -9,7 +9,6 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
 
-
 RIDGE_CANDIDATES = [10.0 ** power for power in range(-8, 14)]
 
 

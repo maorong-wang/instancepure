@@ -136,6 +136,7 @@ def parse_args():
         help="If set, evaluate only the original model (false) or only the HiRA model (true).",
     )
     parser.add_argument("--hira-expansion-dim", "--hira_expansion_dim", type=int, default=4096, help="Hidden expansion dimension for HiRA adapters.")
+    parser.add_argument("--hira-num-blocks", "--hira_num_blocks", type=int, default=2, help="Number of final transformer MLP blocks that receive HiRA adapters.")
     parser.add_argument("--hira-batch-size", "--hira_batch_size", type=int, default=32, help="HiRA fitting batch size.")
     parser.add_argument("--hira-num-workers", "--hira_num_workers", type=int, default=4, help="HiRA fitting DataLoader workers.")
     parser.add_argument("--hira-epochs", "--hira_epochs", type=int, default=1, help="Number of epochs used to fine-tune HiRA.")
@@ -456,8 +457,9 @@ def resolve_attacks(args):
 
 def build_hira_variant_name(base_name, args):
     sample_tag = "full" if args.hira_max_train_samples is None or args.hira_max_train_samples < 0 else str(args.hira_max_train_samples)
+    block_tag = "" if args.hira_num_blocks == 2 else f"-blk{args.hira_num_blocks}"
     return (
-        f"{base_name}-hira-v10-mlp-residual-randact"
+        f"{base_name}-hira-v10-mlp-residual-randact{block_tag}"
         f"-exp{args.hira_expansion_dim}"
         f"-ep{args.hira_epochs}"
         f"-lr{_format_cache_value(args.hira_lr)}"
@@ -547,6 +549,7 @@ def main():
                         classifier_name=classifier_name,
                         dataset_root=args.hira_dataset_root or args.data_dir,
                         expansion_dim=args.hira_expansion_dim,
+                        num_adapter_blocks=args.hira_num_blocks,
                         batch_size=args.hira_batch_size,
                         num_workers=args.hira_num_workers,
                         epochs=args.hira_epochs,
@@ -592,6 +595,7 @@ def main():
                         "eval_examples": eval_examples,
                         "attack_method": args.attack_method or args.attacks,
                         "use_hira": variant_cfg["use_hira"],
+                        "hira_num_blocks": args.hira_num_blocks if variant_cfg["use_hira"] else None,
                         "use_ranpac": variant_cfg["use_ranpac"],
                         "ranpac_selection_method": variant_cfg["ranpac_selection_method"],
                     }

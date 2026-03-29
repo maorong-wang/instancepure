@@ -28,6 +28,8 @@ parameters:
     values: [vit_base]
   use_ranpac_head:
     values: [false, true]
+  hira_num_blocks:
+    values: [2]
   ranpac_rp_dim:
     value: 10000
   ranpac_batch_size:

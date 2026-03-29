@@ -13,7 +13,7 @@
 source /home_fmg/maorong/miniconda3/etc/profile.d/conda.sh
 conda activate diffpure 
 
-SWEEP_ID="maorong-wang/robustbench-ranpac-hira-gelu/tmntqprd"
+SWEEP_ID="maorong-wang/robustbench-ranpac-hira-gelu_num_blocks/57754kx7"
 
 echo "Starting 8 W&B agents with srun"
 echo "Job ID: $SLURM_JOB_ID"

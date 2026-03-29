@@ -1,6 +1,6 @@
 program: eval_robustbench_ranpac.py
 method: grid
-project: robustbench-ranpac-hira-gelu
+project: robustbench-ranpac-hira-gelu_num_blocks
 name: robustbench-ranpac-hira-imagenet
 metric:
   name: robust_acc
@@ -16,13 +16,13 @@ parameters:
     value: ./robustbench_models
   model_names:
     values:
-      - Xu2024MIMIR_Swin-B
+      - Xu2024MIMIR_Swin-L
   use_hira:
-    values: [true, false]
+    values: [true]
   use_ranpac:
-    values: [true, false]
+    values: [true]
   attack_method:
-    values: [pgd]
+    values: [autoattack]
   eval_examples:
     value: 1000
   eval_split:
@@ -41,6 +41,8 @@ parameters:
     value: rand
   hira_expansion_dim:
     value: 8192
+  hira_num_blocks:
+    values: [1, 2, 3, 4, 5, 6, 7, 8]
   hira_batch_size:
     value: 64
   hira_num_workers:
@@ -62,7 +64,7 @@ parameters:
   hira_force_retrain:
     value: false
   ranpac_rp_dim:
-    values: [10000, 8192]
+    values: [8192]
   ranpac_fit_batch_size:
     value: 256
   ranpac_cache_dir:

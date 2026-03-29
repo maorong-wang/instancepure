@@ -59,8 +59,9 @@ def parse_args():
         type=str,
         help=f"classification model. Available: {', '.join(IMAGENET_MODEL)}",
     )
-    parser.add_argument("--use_hira_adapter", type=str2bool, default=False, help="attach HiRA adapters to the last two transformer blocks of ViT-family backbones")
+    parser.add_argument("--use_hira_adapter", type=str2bool, default=False, help="attach HiRA adapters to the last N transformer blocks of ViT-family backbones")
     parser.add_argument("--hira_expansion_dim", type=int, default=4096, help="hidden expansion dimension for HiRA adapters")
+    parser.add_argument("--hira_num_blocks", type=int, default=2, help="number of final transformer MLP blocks that receive HiRA adapters")
     parser.add_argument("--hira_batch_size", type=int, default=32, help="batch size used to fine-tune HiRA weights")
     parser.add_argument("--hira_num_workers", type=int, default=8, help="number of workers used to fine-tune HiRA weights")
     parser.add_argument("--hira_epochs", type=int, default=1, help="number of epochs used to fine-tune HiRA weights")
@@ -364,6 +365,8 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
     classifier_variant = classifier
     if args.use_hira_adapter:
         classifier_variant = f"{classifier_variant}_hira"
+        if args.hira_num_blocks != 2:
+            classifier_variant = f"{classifier_variant}_blk{args.hira_num_blocks}"
     if args.use_ranpac_head:
         classifier_variant = f"{classifier_variant}_ranpac_{args.ranpac_selection_method}"
     lora_dir = args.lora_input_dir or "no_lora"
@@ -387,6 +390,7 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         "imagenet",
         use_hira=args.use_hira_adapter,
         hira_expansion_dim=args.hira_expansion_dim,
+        hira_num_blocks=args.hira_num_blocks,
         hira_batch_size=args.hira_batch_size,
         hira_num_workers=args.hira_num_workers,
         hira_epochs=args.hira_epochs,
