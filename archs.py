@@ -154,11 +154,8 @@ def _build_hira_variant_name(base_name, expansion_dim, epochs, lr, weight_decay,
     sample_tag = "full" if max_train_samples is None or max_train_samples < 0 else str(max_train_samples)
     block_tag = "" if num_adapter_blocks == 2 else f"-blk{num_adapter_blocks}"
     return (
-        f"{base_name}-hira-v10-mlp-residual-randact{block_tag}"
+        f"{base_name}-hira-v22-post-fc2-closedform-gelu{block_tag}"
         f"-exp{expansion_dim}"
-        f"-ep{epochs}"
-        f"-lr{_format_cache_value(lr)}"
-        f"-wd{_format_cache_value(weight_decay)}"
         f"-ns{sample_tag}"
         f"-seed{seed}"
     )

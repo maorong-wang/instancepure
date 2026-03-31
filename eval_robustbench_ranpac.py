@@ -137,16 +137,16 @@ def parse_args():
     )
     parser.add_argument("--hira-expansion-dim", "--hira_expansion_dim", type=int, default=4096, help="Hidden expansion dimension for HiRA adapters.")
     parser.add_argument("--hira-num-blocks", "--hira_num_blocks", type=int, default=2, help="Number of final transformer MLP blocks that receive HiRA adapters.")
-    parser.add_argument("--hira-batch-size", "--hira_batch_size", type=int, default=32, help="HiRA fitting batch size.")
-    parser.add_argument("--hira-num-workers", "--hira_num_workers", type=int, default=4, help="HiRA fitting DataLoader workers.")
-    parser.add_argument("--hira-epochs", "--hira_epochs", type=int, default=1, help="Number of epochs used to fine-tune HiRA.")
-    parser.add_argument("--hira-lr", "--hira_lr", type=float, default=1e-4, help="Learning rate used to fine-tune HiRA.")
-    parser.add_argument("--hira-weight-decay", "--hira_weight_decay", type=float, default=1e-4, help="Weight decay used to fine-tune HiRA.")
-    parser.add_argument("--hira-seed", "--hira_seed", type=int, default=0, help="Seed used to fine-tune and cache HiRA.")
+    parser.add_argument("--hira-batch-size", "--hira_batch_size", type=int, default=32, help="HiRA closed-form fitting batch size.")
+    parser.add_argument("--hira-num-workers", "--hira_num_workers", type=int, default=4, help="HiRA closed-form fitting DataLoader workers.")
+    parser.add_argument("--hira-epochs", "--hira_epochs", type=int, default=1, help="Legacy compatibility flag. Closed-form HiRA ignores this value.")
+    parser.add_argument("--hira-lr", "--hira_lr", type=float, default=1e-4, help="Legacy compatibility flag. Closed-form HiRA ignores this value.")
+    parser.add_argument("--hira-weight-decay", "--hira_weight_decay", type=float, default=1e-4, help="Legacy compatibility flag. Closed-form HiRA ignores this value.")
+    parser.add_argument("--hira-seed", "--hira_seed", type=int, default=0, help="Seed used to sample the closed-form HiRA projection and dataset split.")
     parser.add_argument("--hira-cache-dir", "--hira_cache_dir", default="pretrained/hira_robustbench", help="HiRA cache directory.")
-    parser.add_argument("--hira-dataset-root", "--hira_dataset_root", default="", help="Optional ImageNet root used to fine-tune HiRA. Defaults to --data-dir.")
-    parser.add_argument("--hira-max-train-samples", "--hira_max_train_samples", type=int, default=-1, help="Optional cap on ImageNet train samples used to fine-tune HiRA.")
-    parser.add_argument("--hira-force-retrain", "--hira_force_retrain", type=str2bool, default=False, help="Ignore cached HiRA weights and fine-tune again.")
+    parser.add_argument("--hira-dataset-root", "--hira_dataset_root", default="", help="Optional ImageNet root used to fit closed-form HiRA. Defaults to --data-dir.")
+    parser.add_argument("--hira-max-train-samples", "--hira_max_train_samples", type=int, default=-1, help="Optional cap on ImageNet train samples used to fit closed-form HiRA.")
+    parser.add_argument("--hira-force-retrain", "--hira_force_retrain", type=str2bool, default=False, help="Ignore cached HiRA weights and fit again.")
     parser.add_argument(
         "--use-ranpac",
         "--use_ranpac",
@@ -459,11 +459,8 @@ def build_hira_variant_name(base_name, args):
     sample_tag = "full" if args.hira_max_train_samples is None or args.hira_max_train_samples < 0 else str(args.hira_max_train_samples)
     block_tag = "" if args.hira_num_blocks == 2 else f"-blk{args.hira_num_blocks}"
     return (
-        f"{base_name}-hira-v10-mlp-residual-randact{block_tag}"
+        f"{base_name}-hira-v22-post-fc2-closedform-gelu{block_tag}"
         f"-exp{args.hira_expansion_dim}"
-        f"-ep{args.hira_epochs}"
-        f"-lr{_format_cache_value(args.hira_lr)}"
-        f"-wd{_format_cache_value(args.hira_weight_decay)}"
         f"-ns{sample_tag}"
         f"-seed{args.hira_seed}"
     )

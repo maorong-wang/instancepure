@@ -1,5 +1,4 @@
 import copy
-import math
 import os
 import random
 
@@ -10,32 +9,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
+from classifiers.ranpac import RIDGE_CANDIDATES
 from dataset import get_dataset
-
-
-def _format_cache_value(value):
-    text = str(value)
-    for old, new in ("/", "_"), (" ", ""), (".", "p"), ("-", "m"):
-        text = text.replace(old, new)
-    return text
-
-
-HIRA_ACTIVATION_POOL = ("gelu")
-
-
-def _apply_random_activation(x):
-    if x.is_cuda:
-        activation_index = int(torch.randint(len(HIRA_ACTIVATION_POOL), (), device=x.device).item())
-    else:
-        activation_index = int(torch.randint(len(HIRA_ACTIVATION_POOL), ()).item())
-    activation_name = HIRA_ACTIVATION_POOL[activation_index]
-    if activation_name == "relu":
-        return F.relu(x)
-    if activation_name == "gelu":
-        return F.gelu(x)
-    if activation_name == "silu":
-        return F.silu(x)
-    return F.leaky_relu(x, negative_slope=0.01)
 
 
 class HiRAAdapter(nn.Module):
@@ -45,23 +20,38 @@ class HiRAAdapter(nn.Module):
         self.a_weight = nn.Parameter(torch.empty(out_features, expansion_dim))
         nn.init.kaiming_uniform_(self.a_weight, a=0.0, nonlinearity="relu")
 
+    def project(self, x):
+        token_features = x.reshape(-1, x.shape[-1]).float()
+        return F.gelu(token_features @ self.b_rand.float())
+
     def forward(self, x):
         token_shape = x.shape[:-1]
-        token_features = x.reshape(-1, x.shape[-1]).float()
-        projected = token_features @ self.b_rand
-        projected = _apply_random_activation(projected / math.sqrt(self.b_rand.shape[0]))
+        projected = self.project(x)
         output = projected @ self.a_weight.float().t()
         return output.to(x.dtype).reshape(*token_shape, self.a_weight.shape[0])
 
 
 class HiRAMlpWrapper(nn.Module):
-    def __init__(self, base_mlp, embed_dim, expansion_dim):
+    def __init__(self, base_mlp, expansion_dim):
         super().__init__()
         self.base_mlp = base_mlp
-        self.mlp_adapter = HiRAAdapter(embed_dim, embed_dim, expansion_dim)
+        mlp_output_dim = _infer_mlp_output_dim(base_mlp)
+        self.mlp_adapter = HiRAAdapter(mlp_output_dim, mlp_output_dim, expansion_dim)
+
+    def post_fc2(self, x):
+        x = self.base_mlp.fc1(x)
+        if hasattr(self.base_mlp, "act"):
+            x = self.base_mlp.act(x)
+        if hasattr(self.base_mlp, "drop1"):
+            x = self.base_mlp.drop1(x)
+        elif hasattr(self.base_mlp, "drop"):
+            x = self.base_mlp.drop(x)
+        if hasattr(self.base_mlp, "norm"):
+            x = self.base_mlp.norm(x)
+        return self.base_mlp.fc2(x)
 
     def forward(self, x, *args, **kwargs):
-        return self.base_mlp(x, *args, **kwargs) + self.mlp_adapter(x)
+        return self.mlp_adapter(self.post_fc2(x))
 
 
 def _get_module_by_name(model, module_name):
@@ -87,15 +77,15 @@ def _list_mlp_modules(model):
     ]
 
 
-def _infer_mlp_embed_dim(module):
-    for attr_path in ("fc1.in_features", "fc2.out_features"):
+def _infer_mlp_output_dim(module):
+    for attr_path in ("fc2.out_features", "fc2.out_channels"):
         try:
             candidate = _get_module_by_name(module, attr_path)
         except AttributeError:
             continue
         if isinstance(candidate, int):
             return candidate
-    raise ValueError("Unable to infer MLP embed dimension for HiRA attachment.")
+    raise ValueError("Unable to infer MLP output dimension for HiRA attachment.")
 
 
 def _resolve_target_mlp_modules(model, num_adapter_blocks):
@@ -115,31 +105,9 @@ def _attach_hira_modules(model, expansion_dim, num_adapter_blocks):
         if isinstance(module, HiRAMlpWrapper):
             target_mlp_names.append(module_name)
             continue
-        _set_module_by_name(model, module_name, HiRAMlpWrapper(module, _infer_mlp_embed_dim(module), expansion_dim))
+        _set_module_by_name(model, module_name, HiRAMlpWrapper(module, expansion_dim))
         target_mlp_names.append(module_name)
     return target_mlp_names
-
-
-def _find_last_linear_module_names(model):
-    return [name for name, module in model.named_modules() if isinstance(module, nn.Linear)]
-
-
-def _find_classifier_module_names(model):
-    module_names = []
-    for candidate in ("model.head", "model.fc", "model.classifier", "head", "fc", "classifier"):
-        try:
-            module = _get_module_by_name(model, candidate)
-        except AttributeError:
-            continue
-        if any(True for _ in module.parameters(recurse=True)):
-            module_names.append(candidate)
-
-    if not module_names:
-        linear_names = _find_last_linear_module_names(model)
-        if linear_names:
-            module_names.append(linear_names[-1])
-
-    return list(dict.fromkeys(module_names))
 
 
 def _freeze_model(model):
@@ -147,27 +115,12 @@ def _freeze_model(model):
         parameter.requires_grad = False
 
 
-def _mark_trainable(model, mlp_module_names):
-    _freeze_model(model)
-
-    for mlp_module_name in mlp_module_names:
-        wrapper = _get_module_by_name(model, mlp_module_name)
-        for parameter in wrapper.mlp_adapter.parameters():
-            parameter.requires_grad = True
-
-    for module_name in _find_classifier_module_names(model):
-        module = _get_module_by_name(model, module_name)
-        for parameter in module.parameters():
-            parameter.requires_grad = True
-
-
-def _cached_hira_state_dict(model):
-    trainable_keys = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
-    state_dict = model.state_dict()
+def _cached_hira_state_dict(model, mlp_module_names):
+    cache_prefixes = tuple(f"{module_name}.mlp_adapter." for module_name in mlp_module_names)
     return {
         name: tensor.detach().cpu()
-        for name, tensor in state_dict.items()
-        if name in trainable_keys or name.endswith(".b_rand")
+        for name, tensor in model.state_dict().items()
+        if name.startswith(cache_prefixes)
     }
 
 
@@ -181,11 +134,8 @@ def _build_cache_name(classifier_name, expansion_dim, epochs, lr, weight_decay, 
     sample_tag = "full" if max_train_samples is None or max_train_samples < 0 else str(max_train_samples)
     block_tag = _format_block_tag(num_adapter_blocks, "_blk")
     return (
-        f"{classifier_name.replace('/', '_')}_hira_v10_mlp_residual_randact{block_tag}"
+        f"{classifier_name.replace('/', '_')}_hira_v22_post_fc2_closedform_gelu{block_tag}"
         f"_exp{expansion_dim}"
-        f"_ep{epochs}"
-        f"_lr{_format_cache_value(lr)}"
-        f"_wd{_format_cache_value(weight_decay)}"
         f"_ns{sample_tag}"
         f"_seed{seed}.pt"
     )
@@ -199,82 +149,182 @@ def _seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def _build_train_loader(dataset_root, batch_size, num_workers, seed, max_train_samples):
+def _build_train_loaders(dataset_root, batch_size, num_workers, seed, max_train_samples):
     if dataset_root:
         os.environ["IMAGENET_LOC_ENV"] = dataset_root
 
     dataset = get_dataset("imagenet", split="train", adv=False)
-    if max_train_samples is not None and max_train_samples > 0 and max_train_samples < len(dataset):
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        indices = torch.randperm(len(dataset), generator=generator)[:max_train_samples].tolist()
-        dataset = Subset(dataset, indices)
-
     generator = torch.Generator()
     generator.manual_seed(seed)
-    return DataLoader(
-        dataset,
+    indices = torch.randperm(len(dataset), generator=generator).tolist()
+    if max_train_samples is not None and max_train_samples > 0 and max_train_samples < len(indices):
+        indices = indices[:max_train_samples]
+
+    if len(indices) == 1:
+        train_indices = indices
+        val_indices = []
+    else:
+        train_cutoff = int(len(indices) * 0.8)
+        train_cutoff = min(max(train_cutoff, 1), len(indices) - 1)
+        train_indices = indices[:train_cutoff]
+        val_indices = indices[train_cutoff:]
+
+    train_subset = Subset(dataset, train_indices)
+    val_subset = Subset(dataset, val_indices)
+
+    common_kwargs = dict(
         batch_size=batch_size,
-        shuffle=True,
-        generator=generator,
+        shuffle=False,
         pin_memory=torch.cuda.is_available(),
         num_workers=num_workers,
     )
+    return (
+        DataLoader(train_subset, **common_kwargs),
+        DataLoader(val_subset, **common_kwargs),
+    )
 
 
-def _kl_distillation_loss(student_logits, teacher_logits, temperature=1.0):
-    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
-    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
-    return F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature ** 2)
+def _init_hira_statistics(model, mlp_module_names, stats_device):
+    statistics = {}
+    for module_name in mlp_module_names:
+        wrapper = _get_module_by_name(model, module_name)
+        rp_dim = wrapper.mlp_adapter.b_rand.size(1)
+        out_dim = wrapper.mlp_adapter.a_weight.size(0)
+        statistics[module_name] = {
+            "g_matrix": torch.zeros(rp_dim, rp_dim, dtype=torch.float32, device=stats_device),
+            "q_matrix": torch.zeros(rp_dim, out_dim, dtype=torch.float32, device=stats_device),
+            "target_norm": torch.zeros((), dtype=torch.float32, device=stats_device),
+            "sample_count": 0,
+        }
+    return statistics
 
 
-def _fit_hira_weights(model, teacher_model, loader, device, epochs, lr, weight_decay, grad_clip_norm=1.0):
-    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    if not trainable_parameters:
-        raise ValueError("HiRA did not mark any parameters as trainable.")
+def _select_ridge_by_regression_loss(g_train, q_train, g_val, q_val, val_target_norm, out_features, val_sample_count, device):
+    if val_sample_count == 0:
+        return RIDGE_CANDIDATES[0], None
 
-    optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
-    model = model.to(device).eval()
+    g_train = g_train.to(device)
+    q_train = q_train.to(device)
+    g_val = g_val.to(device)
+    q_val = q_val.to(device)
+    eye = torch.eye(g_train.size(0), device=device, dtype=g_train.dtype)
+
+    best_ridge = RIDGE_CANDIDATES[0]
+    best_loss = None
+    denominator = max(val_sample_count * out_features, 1)
+
+    with torch.no_grad():
+        for ridge in RIDGE_CANDIDATES:
+            weight = torch.linalg.solve(g_train + ridge * eye, q_train).t()
+            quadratic = torch.trace(weight @ g_val @ weight.t())
+            cross_term = torch.trace(weight @ q_val)
+            loss = (quadratic - 2.0 * cross_term + val_target_norm) / denominator
+            loss_value = loss.item()
+            if best_loss is None or loss_value < best_loss:
+                best_loss = loss_value
+                best_ridge = ridge
+
+    return best_ridge, best_loss
+
+
+def _accumulate_hira_statistics(model, teacher_model, loader, mlp_module_names, device, description):
+    stats_device = device if device.type == "cuda" else torch.device("cpu")
+    statistics = _init_hira_statistics(model, mlp_module_names, stats_device)
+    b_rand_by_module = {
+        module_name: _get_module_by_name(model, module_name).mlp_adapter.b_rand.to(device=stats_device, dtype=torch.float32)
+        for module_name in mlp_module_names
+    }
+    batch_cache = {}
+    handles = []
+
+    for module_name in mlp_module_names:
+        teacher_module = _get_module_by_name(teacher_model, module_name)
+        teacher_fc2 = teacher_module.fc2
+
+        def hook(_, inputs, output, module_name=module_name):
+            batch_cache[module_name] = output.detach()
+
+        handles.append(teacher_fc2.register_forward_hook(hook))
+
     teacher_model = teacher_model.to(device).eval()
-    for parameter in teacher_model.parameters():
-        parameter.requires_grad = False
+    try:
+        with torch.no_grad():
+            for inputs, _ in tqdm(loader, desc=description):
+                batch_cache.clear()
+                _ = teacher_model(inputs.to(device, non_blocking=True))
+                for module_name in mlp_module_names:
+                    mlp_outputs = batch_cache[module_name]
+                    token_features = mlp_outputs.reshape(-1, mlp_outputs.shape[-1]).to(stats_device, dtype=torch.float32)
+                    projected = F.gelu(token_features @ b_rand_by_module[module_name])
+                    targets = token_features
 
-    for epoch in range(epochs):
-        running_loss = 0.0
-        sample_count = 0
+                    statistics[module_name]["g_matrix"] += projected.t() @ projected
+                    statistics[module_name]["q_matrix"] += projected.t() @ targets
+                    statistics[module_name]["target_norm"] += targets.square().sum()
+                    statistics[module_name]["sample_count"] += targets.size(0)
 
-        progress = tqdm(loader, desc=f"HiRA fine-tune {epoch + 1}/{epochs}")
-        for inputs, _ in progress:
-            inputs = inputs.to(device, non_blocking=True)
+                    del token_features, projected, targets
+    finally:
+        for handle in handles:
+            handle.remove()
 
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(inputs).float()
-            with torch.no_grad():
-                teacher_logits = teacher_model(inputs).float()
-            loss = _kl_distillation_loss(logits, teacher_logits)
+    return statistics
 
-            if not torch.isfinite(loss):
-                raise FloatingPointError(
-                    "Non-finite HiRA loss detected. "
-                    "The MLP HiRA projection is diverging; try a smaller --hira-lr or --hira-expansion-dim."
-                )
 
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, grad_clip_norm)
-            if not torch.isfinite(grad_norm):
-                raise FloatingPointError(
-                    "Non-finite HiRA gradient norm detected. "
-                    "The MLP HiRA projection is numerically unstable."
-                )
-            optimizer.step()
+def _fit_hira_weights_closed_form(model, teacher_model, train_loader, val_loader, mlp_module_names, device):
+    train_stats = _accumulate_hira_statistics(
+        model,
+        teacher_model,
+        train_loader,
+        mlp_module_names,
+        device,
+        description="HiRA train stats",
+    )
+    val_stats = _accumulate_hira_statistics(
+        model,
+        teacher_model,
+        val_loader,
+        mlp_module_names,
+        device,
+        description="HiRA val stats",
+    )
 
-            batch_size = inputs.size(0)
-            running_loss += loss.item() * batch_size
-            sample_count += batch_size
-            progress.set_postfix(loss=f"{running_loss / max(sample_count, 1):.4f}")
+    fit_summary = {}
+    for module_name in mlp_module_names:
+        wrapper = _get_module_by_name(model, module_name)
+        train_entry = train_stats[module_name]
+        val_entry = val_stats[module_name]
+        out_features = wrapper.mlp_adapter.a_weight.size(0)
 
-    model.eval()
-    return model
+        ridge, regression_loss = _select_ridge_by_regression_loss(
+            train_entry["g_matrix"],
+            train_entry["q_matrix"],
+            val_entry["g_matrix"],
+            val_entry["q_matrix"],
+            val_entry["target_norm"],
+            out_features,
+            val_entry["sample_count"],
+            device,
+        )
+
+        g_full = (train_entry["g_matrix"] + val_entry["g_matrix"]).to(device)
+        q_full = (train_entry["q_matrix"] + val_entry["q_matrix"]).to(device)
+        eye = torch.eye(g_full.size(0), device=device, dtype=g_full.dtype)
+        weight = torch.linalg.solve(g_full + ridge * eye, q_full).t().cpu()
+        with torch.no_grad():
+            wrapper.mlp_adapter.a_weight.copy_(weight)
+
+        fit_summary[module_name] = {
+            "ridge": ridge,
+            "regression_loss": regression_loss,
+            "train_tokens": train_entry["sample_count"],
+            "val_tokens": val_entry["sample_count"],
+        }
+        print(f"HiRA optimal ridge for {module_name}: {ridge}")
+        if regression_loss is not None:
+            print(f"HiRA regression loss for {module_name}: {regression_loss:.6f}")
+
+    return fit_summary
 
 
 def apply_hira_adaptation(
@@ -303,7 +353,7 @@ def apply_hira_adaptation(
     teacher_model = copy.deepcopy(model).eval()
     _seed_everything(seed)
     mlp_module_names = _attach_hira_modules(model, expansion_dim, num_adapter_blocks)
-    _mark_trainable(model, mlp_module_names)
+    _freeze_model(model)
 
     os.makedirs(cache_dir, exist_ok=True)
     cache_path = os.path.join(
@@ -325,33 +375,41 @@ def apply_hira_adaptation(
         model.load_state_dict(state["hira_state"], strict=False)
         return model.eval()
 
-    loader = _build_train_loader(dataset_root, batch_size, num_workers, seed, max_train_samples)
-    _fit_hira_weights(model, teacher_model, loader, device, epochs, lr, weight_decay, grad_clip_norm=grad_clip_norm)
+    print(f"Fitting HiRA replacement layers for {cache_path}...")
+    train_loader, val_loader = _build_train_loaders(dataset_root, batch_size, num_workers, seed, max_train_samples)
+    fit_summary = _fit_hira_weights_closed_form(
+        model,
+        teacher_model,
+        train_loader,
+        val_loader,
+        mlp_module_names,
+        device,
+    )
 
     state = {
+        "version": 22,
         "classifier_name": classifier_name,
         "expansion_dim": expansion_dim,
-        "epochs": epochs,
-        "lr": lr,
-        "weight_decay": weight_decay,
-        "grad_clip_norm": grad_clip_norm,
         "max_train_samples": max_train_samples,
         "seed": seed,
         "num_adapter_blocks": num_adapter_blocks,
         "mlp_module_names": mlp_module_names,
-        "loss_type": "teacher_kl",
-        "headwise_randomization": False,
+        "fit_method": "ridge_regression",
+        "ridge_candidates": RIDGE_CANDIDATES,
+        "soft_label_source": "original_mlp_output",
+        "activation": "gelu",
         "frozen_b": True,
-        "normalized_random_projection": True,
+        "ridge_fit_summary": fit_summary,
         "forward_dtype": "float32",
         "value_only": False,
         "token_projection": False,
         "mlp_projection": True,
-        "mlp_residual": True,
-        "random_activation_pool": list(HIRA_ACTIVATION_POOL),
+        "mlp_residual": False,
+        "post_fc2_attachment": True,
+        "fc2_replacement": False,
         "insert_before_last_blocks": 0,
         "insert_on_last_blocks_mlp": num_adapter_blocks,
-        "hira_state": _cached_hira_state_dict(model),
+        "hira_state": _cached_hira_state_dict(model, mlp_module_names),
     }
     torch.save(state, cache_path)
     return model.eval()
