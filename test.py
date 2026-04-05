@@ -82,9 +82,9 @@ def parse_args():
     parser.add_argument(
         "--ranpac_selection_method",
         type=str,
-        choices=["regression", "val_acc"],
+        choices=["regression"],
         default="regression",
-        help="which cached RanPAC head to apply after fitting both ridge-selection variants",
+        help="which cached RanPAC head to apply; only regression-loss ridge selection is supported",
     )
     parser.add_argument("--ranpac_cache_dir", type=str, default="pretrained/ranpac", help="cache directory for fitted RanPAC heads")
     parser.add_argument("--ranpac_dataset_root", type=str, default=None, help="ImageNet root used when fitting a RanPAC head")
@@ -96,6 +96,13 @@ def parse_args():
     parser.add_argument("--wandb_name", type=str, default="", help="Weights & Biases run name")
     parser.add_argument("--wandb_group", type=str, default="", help="Weights & Biases run group")
     parser.add_argument("--wandb_mode", type=str, default="online", help="Weights & Biases mode: online, offline, or disabled")
+    parser.add_argument(
+        "--attack_version",
+        type=str,
+        choices=["v1", "v2"],
+        default="v1",
+        help="Attack pipeline version: v1 attacks the raw classifier, v2 runs DiffPGD through the denoiser.",
+    )
     parser.add_argument("--atk_iter", type=int, default=40, help="")
     parser.add_argument("--eps", type=int, default=4, help="")
     args = parser.parse_args()
@@ -179,27 +186,38 @@ class Denoised_Classifier(torch.nn.Module):
         self.diffusion = diffusion
         self.model = model
         self.t = t
-    def sdedit(self, x, t, to_01=True):
 
-        # assume the input is 0-1
-        t_int = t
+    def _resolve_diffusion_timestep(self, t):
+        requested_t = int(t)
+        if hasattr(self.diffusion, "timestep_map") and self.diffusion.timestep_map:
+            valid_steps = list(self.diffusion.timestep_map)
+            floor_index = 0
+            for index, original_step in enumerate(valid_steps):
+                if original_step > requested_t:
+                    break
+                floor_index = index
+            return floor_index
+        max_t = len(self.diffusion.sqrt_alphas_cumprod) - 1
+        return max(0, min(requested_t, max_t))
+
+    def sdedit(self, x, t, to_01=True):
+        resolved_t = self._resolve_diffusion_timestep(t)
 
         x = x * 2 - 1
 
-        t = torch.full((x.shape[0],), t).long().to(x.device)
+        t_tensor = torch.full((x.shape[0],), resolved_t, dtype=torch.long, device=x.device)
 
-        x_t = self.diffusion.q_sample(x, t)
+        x_t = self.diffusion.q_sample(x, t_tensor)
 
         sample = x_t
 
-        indices = list(range(t + 1))[::-1]
+        indices = list(range(resolved_t + 1))[::-1]
 
         # visualize
         l_sample = []
         l_predxstart = []
 
         for i in indices:
-            # out = self.diffusion.ddim_sample(self.model, sample, t)
             out = self.diffusion.ddim_sample(self.model, sample, torch.full((x.shape[0],), i).long().to(x.device))
    
             sample = out["sample"]
@@ -544,4 +562,4 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
 if __name__ == '__main__':
     args = parse_args()
     Global(args.classifier, args.device, 'ddim50', t=150, eps=args.eps, iter=args.atk_iter, name='attack_global_gradpass', alpha=1,                     #4/255 pgd-100 if want to run autoattack 4/255 just run this and add args.attack_method=AutoAttack
-                args=args, version="v1")
+                args=args, version=args.attack_version)

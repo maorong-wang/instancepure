@@ -1,6 +1,7 @@
 import copy
 import os
 import random
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -13,21 +14,72 @@ from classifiers.ranpac import RIDGE_CANDIDATES
 from dataset import get_dataset
 
 
+HIRA_CACHE_VERSION = 24
+
+
+class HiRAHalfPrecisionWrapper(nn.Module):
+    def __init__(self, base_model):
+        super().__init__()
+        self.base_model = base_model
+        self.use_autocast = True
+
+    def forward(self, x):
+        autocast_context = nullcontext()
+        if self.use_autocast and x.device.type == "cuda":
+            autocast_context = torch.autocast(device_type="cuda", dtype=torch.float16)
+        with autocast_context:
+            return self.base_model(x)
+
+
 class HiRAAdapter(nn.Module):
     def __init__(self, in_features, out_features, expansion_dim):
         super().__init__()
-        self.register_buffer("b_rand", torch.randn(in_features, expansion_dim, dtype=torch.float32))
-        self.a_weight = nn.Parameter(torch.empty(out_features, expansion_dim))
+        self.register_buffer("b_rand", torch.randn(in_features, expansion_dim, dtype=torch.float16))
+        self.a_weight = nn.Parameter(torch.empty(out_features, expansion_dim, dtype=torch.float16))
+        self.force_fp32 = False
+        self._fp32_cache_device = None
+        self._b_rand_fp32 = None
+        self._a_weight_fp32 = None
         nn.init.kaiming_uniform_(self.a_weight, a=0.0, nonlinearity="relu")
 
+    def clear_fp32_cache(self):
+        self._fp32_cache_device = None
+        self._b_rand_fp32 = None
+        self._a_weight_fp32 = None
+
+    def _ensure_fp32_cache(self, device):
+        cache_device = str(device)
+        if self._fp32_cache_device == cache_device:
+            return
+        self._b_rand_fp32 = self.b_rand.detach().float().to(device=device)
+        self._a_weight_fp32 = self.a_weight.detach().float().to(device=device)
+        self._fp32_cache_device = cache_device
+
     def project(self, x):
-        token_features = x.reshape(-1, x.shape[-1]).float()
+        token_features = x.reshape(-1, x.shape[-1])
+        if self.force_fp32:
+            token_features = token_features.float()
+            if token_features.device.type == "cuda":
+                self._ensure_fp32_cache(token_features.device)
+                return F.gelu(token_features @ self._b_rand_fp32)
+            return F.gelu(token_features @ self.b_rand.float())
+        if token_features.device.type == "cuda":
+            token_features = token_features.to(dtype=self.b_rand.dtype)
+            return F.gelu(token_features @ self.b_rand)
+        token_features = token_features.float()
         return F.gelu(token_features @ self.b_rand.float())
 
     def forward(self, x):
         token_shape = x.shape[:-1]
         projected = self.project(x)
-        output = projected @ self.a_weight.float().t()
+        if projected.device.type == "cuda" and not self.force_fp32:
+            output = projected @ self.a_weight.t()
+        else:
+            if projected.device.type == "cuda":
+                self._ensure_fp32_cache(projected.device)
+                output = projected.float() @ self._a_weight_fp32.t()
+            else:
+                output = projected.float() @ self.a_weight.float().t()
         return output.to(x.dtype).reshape(*token_shape, self.a_weight.shape[0])
 
 
@@ -124,21 +176,84 @@ def _cached_hira_state_dict(model, mlp_module_names):
     }
 
 
+def _enable_half_precision_forward(model):
+    if isinstance(model, HiRAHalfPrecisionWrapper):
+        return model
+    return HiRAHalfPrecisionWrapper(model)
+
+
+def set_hira_half_precision(model, enabled):
+    for module in model.modules():
+        if isinstance(module, HiRAHalfPrecisionWrapper):
+            module.use_autocast = enabled
+        elif isinstance(module, HiRAAdapter):
+            module.force_fp32 = not enabled
+            if enabled:
+                module.clear_fp32_cache()
+    return model
+
+
+def _prepare_hira_model_for_eval(model):
+    if isinstance(model, HiRAHalfPrecisionWrapper):
+        model.use_autocast = False
+        model = model.base_model
+    model = model.float()
+    for module in model.modules():
+        if isinstance(module, HiRAAdapter):
+            module.force_fp32 = False
+            module.clear_fp32_cache()
+    return model.eval()
+
+
 def _format_block_tag(num_adapter_blocks, prefix):
     if num_adapter_blocks == 2:
         return ""
     return f"{prefix}{num_adapter_blocks}"
 
 
-def _build_cache_name(classifier_name, expansion_dim, epochs, lr, weight_decay, max_train_samples, seed, num_adapter_blocks):
+def build_hira_variant_name(
+    classifier_name,
+    expansion_dim,
+    epochs,
+    lr,
+    weight_decay,
+    max_train_samples,
+    seed,
+    num_adapter_blocks,
+):
+    del epochs, lr, weight_decay
+
     sample_tag = "full" if max_train_samples is None or max_train_samples < 0 else str(max_train_samples)
-    block_tag = _format_block_tag(num_adapter_blocks, "_blk")
+    block_tag = _format_block_tag(num_adapter_blocks, "-blk")
     return (
-        f"{classifier_name.replace('/', '_')}_hira_v22_post_fc2_closedform_gelu{block_tag}"
-        f"_exp{expansion_dim}"
-        f"_ns{sample_tag}"
-        f"_seed{seed}.pt"
+        f"{classifier_name}-hira-v{HIRA_CACHE_VERSION}-post-fc2-closedform-gelu"
+        f"{block_tag}"
+        f"-exp{expansion_dim}"
+        f"-ns{sample_tag}"
+        f"-seed{seed}"
     )
+
+
+def _build_cache_name(
+    classifier_name,
+    expansion_dim,
+    epochs,
+    lr,
+    weight_decay,
+    max_train_samples,
+    seed,
+    num_adapter_blocks,
+):
+    return build_hira_variant_name(
+        classifier_name=classifier_name,
+        expansion_dim=expansion_dim,
+        epochs=epochs,
+        lr=lr,
+        weight_decay=weight_decay,
+        max_train_samples=max_train_samples,
+        seed=seed,
+        num_adapter_blocks=num_adapter_blocks,
+    ).replace("/", "_") + ".pt"
 
 
 def _seed_everything(seed):
@@ -149,11 +264,13 @@ def _seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def _build_train_loaders(dataset_root, batch_size, num_workers, seed, max_train_samples):
+def _build_train_loaders(dataset_root, batch_size, num_workers, seed, max_train_samples, train_transform=None):
     if dataset_root:
         os.environ["IMAGENET_LOC_ENV"] = dataset_root
 
     dataset = get_dataset("imagenet", split="train", adv=False)
+    if hasattr(dataset, "transform") and train_transform is not None:
+        dataset.transform = train_transform
     generator = torch.Generator()
     generator.manual_seed(seed)
     indices = torch.randperm(len(dataset), generator=generator).tolist()
@@ -199,7 +316,16 @@ def _init_hira_statistics(model, mlp_module_names, stats_device):
     return statistics
 
 
-def _select_ridge_by_regression_loss(g_train, q_train, g_val, q_val, val_target_norm, out_features, val_sample_count, device):
+def _select_ridge_by_regression_loss(
+    g_train,
+    q_train,
+    g_val,
+    q_val,
+    val_target_norm,
+    out_features,
+    val_sample_count,
+    device,
+):
     if val_sample_count == 0:
         return RIDGE_CANDIDATES[0], None
 
@@ -231,7 +357,10 @@ def _accumulate_hira_statistics(model, teacher_model, loader, mlp_module_names, 
     stats_device = device if device.type == "cuda" else torch.device("cpu")
     statistics = _init_hira_statistics(model, mlp_module_names, stats_device)
     b_rand_by_module = {
-        module_name: _get_module_by_name(model, module_name).mlp_adapter.b_rand.to(device=stats_device, dtype=torch.float32)
+        module_name: _get_module_by_name(model, module_name).mlp_adapter.b_rand.to(
+            device=stats_device,
+            dtype=torch.float16 if stats_device.type == "cuda" else torch.float32,
+        )
         for module_name in mlp_module_names
     }
     batch_cache = {}
@@ -251,11 +380,16 @@ def _accumulate_hira_statistics(model, teacher_model, loader, mlp_module_names, 
         with torch.no_grad():
             for inputs, _ in tqdm(loader, desc=description):
                 batch_cache.clear()
-                _ = teacher_model(inputs.to(device, non_blocking=True))
+                autocast_context = nullcontext()
+                if device.type == "cuda":
+                    autocast_context = torch.autocast(device_type="cuda", dtype=torch.float16)
+                with autocast_context:
+                    _ = teacher_model(inputs.to(device, non_blocking=True))
                 for module_name in mlp_module_names:
                     mlp_outputs = batch_cache[module_name]
                     token_features = mlp_outputs.reshape(-1, mlp_outputs.shape[-1]).to(stats_device, dtype=torch.float32)
-                    projected = F.gelu(token_features @ b_rand_by_module[module_name])
+                    projected_inputs = token_features.to(dtype=b_rand_by_module[module_name].dtype)
+                    projected = F.gelu(projected_inputs @ b_rand_by_module[module_name]).float()
                     targets = token_features
 
                     statistics[module_name]["g_matrix"] += projected.t() @ projected
@@ -263,7 +397,7 @@ def _accumulate_hira_statistics(model, teacher_model, loader, mlp_module_names, 
                     statistics[module_name]["target_norm"] += targets.square().sum()
                     statistics[module_name]["sample_count"] += targets.size(0)
 
-                    del token_features, projected, targets
+                    del token_features, projected_inputs, projected, targets
     finally:
         for handle in handles:
             handle.remove()
@@ -310,7 +444,7 @@ def _fit_hira_weights_closed_form(model, teacher_model, train_loader, val_loader
         g_full = (train_entry["g_matrix"] + val_entry["g_matrix"]).to(device)
         q_full = (train_entry["q_matrix"] + val_entry["q_matrix"]).to(device)
         eye = torch.eye(g_full.size(0), device=device, dtype=g_full.dtype)
-        weight = torch.linalg.solve(g_full + ridge * eye, q_full).t().cpu()
+        weight = torch.linalg.solve(g_full + ridge * eye, q_full).t().to(dtype=wrapper.mlp_adapter.a_weight.dtype).cpu()
         with torch.no_grad():
             wrapper.mlp_adapter.a_weight.copy_(weight)
 
@@ -344,6 +478,7 @@ def apply_hira_adaptation(
     cache_dir="pretrained/hira",
     max_train_samples=-1,
     force_retrain=False,
+    train_transform=None,
 ):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -359,24 +494,31 @@ def apply_hira_adaptation(
     cache_path = os.path.join(
         cache_dir,
         _build_cache_name(
-            classifier_name,
-            expansion_dim,
-            epochs,
-            lr,
-            weight_decay,
-            max_train_samples,
-            seed,
-            num_adapter_blocks,
+            classifier_name=classifier_name,
+            expansion_dim=expansion_dim,
+            epochs=epochs,
+            lr=lr,
+            weight_decay=weight_decay,
+            max_train_samples=max_train_samples,
+            seed=seed,
+            num_adapter_blocks=num_adapter_blocks,
         ),
     )
 
     if os.path.exists(cache_path) and not force_retrain:
         state = torch.load(cache_path, map_location="cpu")
         model.load_state_dict(state["hira_state"], strict=False)
-        return model.eval()
+        return _prepare_hira_model_for_eval(model)
 
     print(f"Fitting HiRA replacement layers for {cache_path}...")
-    train_loader, val_loader = _build_train_loaders(dataset_root, batch_size, num_workers, seed, max_train_samples)
+    train_loader, val_loader = _build_train_loaders(
+        dataset_root,
+        batch_size,
+        num_workers,
+        seed,
+        max_train_samples,
+        train_transform=train_transform,
+    )
     fit_summary = _fit_hira_weights_closed_form(
         model,
         teacher_model,
@@ -387,7 +529,7 @@ def apply_hira_adaptation(
     )
 
     state = {
-        "version": 22,
+        "version": HIRA_CACHE_VERSION,
         "classifier_name": classifier_name,
         "expansion_dim": expansion_dim,
         "max_train_samples": max_train_samples,
@@ -400,7 +542,11 @@ def apply_hira_adaptation(
         "activation": "gelu",
         "frozen_b": True,
         "ridge_fit_summary": fit_summary,
-        "forward_dtype": "float32",
+        "cache_adapter_dtype": "float16",
+        "fit_forward_dtype": "float16" if device.type == "cuda" else "float32",
+        "fit_backbone_autocast": device.type == "cuda",
+        "eval_forward_dtype": "float32",
+        "eval_backbone_autocast": False,
         "value_only": False,
         "token_projection": False,
         "mlp_projection": True,
@@ -412,4 +558,4 @@ def apply_hira_adaptation(
         "hira_state": _cached_hira_state_dict(model, mlp_module_names),
     }
     torch.save(state, cache_path)
-    return model.eval()
+    return _prepare_hira_model_for_eval(model)

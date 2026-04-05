@@ -1,7 +1,7 @@
 program: test.py
 method: grid
-project: instantpure
-name: imagenet-vit-swin-ranpac
+project: instantpure-diffpgd
+name: imagenet-vit-swin-diffpgd-hira-ranpac
 metric:
   name: robust_accuracy
   goal: maximize
@@ -10,6 +10,8 @@ parameters:
     value: LCM
   attack_method:
     value: Linf_pgd
+  attack_version:
+    value: v2
   output_dir:
     value: output
   lora_input_dir:
@@ -26,12 +28,30 @@ parameters:
     value: 0.8
   classifier:
     values: [vit_base]
+  use_hira_adapter:
+    values: [false, true]
+  hira_expansion_dim:
+    value: 32768
   use_ranpac_head:
     values: [false, true]
   hira_num_blocks:
     values: [2]
+  hira_batch_size:
+    value: 256
+  hira_num_workers:
+    value: 8
+  hira_seed:
+    value: 0
+  hira_cache_dir:
+    value: pretrained/hira
+  hira_dataset_root:
+    value: ./dataset/imagenet
+  hira_max_train_samples:
+    value: -1
+  hira_force_retrain:
+    value: false
   ranpac_rp_dim:
-    value: 10000
+    value: 8192
   ranpac_batch_size:
     value: 256
   ranpac_num_workers:
@@ -49,13 +69,13 @@ parameters:
   wandb_project:
     value: instantpure
   wandb_group:
-    value: imagenet-vit-swin-ranpac
+    value: imagenet-vit-swin-diffpgd-hira-ranpac
   wandb_mode:
     value: online
   eps:
-    values: [2, 4, 8]
+    values: [8, 4]
   atk_iter:
-    values: [100, 40]
+    values: [100]
 command:
   - ${env}
   - ${interpreter}

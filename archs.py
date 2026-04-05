@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torchvision
 
-from classifiers.hira import apply_hira_adaptation
+from classifiers.hira import apply_hira_adaptation, build_hira_variant_name
 from classifiers.ranpac import apply_ranpac_head
 
 
@@ -143,24 +143,6 @@ def _supports_hira(arch):
     return arch.startswith("vit_") or arch.startswith("swin_")
 
 
-def _format_cache_value(value):
-    text = str(value)
-    for old, new in (("/", "_"), (" ", ""), (".", "p"), ("-", "m")):
-        text = text.replace(old, new)
-    return text
-
-
-def _build_hira_variant_name(base_name, expansion_dim, epochs, lr, weight_decay, max_train_samples, seed, num_adapter_blocks):
-    sample_tag = "full" if max_train_samples is None or max_train_samples < 0 else str(max_train_samples)
-    block_tag = "" if num_adapter_blocks == 2 else f"-blk{num_adapter_blocks}"
-    return (
-        f"{base_name}-hira-v22-post-fc2-closedform-gelu{block_tag}"
-        f"-exp{expansion_dim}"
-        f"-ns{sample_tag}"
-        f"-seed{seed}"
-    )
-
-
 def get_archs(
     arch,
     dataset="imagenet",
@@ -215,7 +197,7 @@ def get_archs(
             max_train_samples=hira_max_train_samples,
             force_retrain=hira_force_retrain,
         )
-        classifier_name = _build_hira_variant_name(
+        classifier_name = build_hira_variant_name(
             classifier_name,
             expansion_dim=hira_expansion_dim,
             epochs=hira_epochs,

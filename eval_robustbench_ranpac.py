@@ -28,23 +28,27 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
-from autoattack import AutoAttack
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
-from classifiers.hira import apply_hira_adaptation
+from classifiers.hira import apply_hira_adaptation, build_hira_variant_name
 from classifiers.ranpac import apply_ranpac_head
 from dataset import get_dataset as instantpure_get_dataset
 
 try:
-    from robustbench import load_model
+    from autoattack import AutoAttack
+except ImportError:
+    AutoAttack = None
+
+try:
+    from robustbench import benchmark, load_model
     from robustbench.data import get_preprocessing
     from robustbench.model_zoo.enums import BenchmarkDataset, ThreatModel
 except ImportError:
     fallback_root = Path(__file__).resolve().parent.parent / "adversarial-attacks-pytorch"
     if str(fallback_root) not in sys.path:
         sys.path.insert(0, str(fallback_root))
-    from robustbench import load_model
+    from robustbench import benchmark, load_model
     from robustbench.data import get_preprocessing
     from robustbench.model_zoo.enums import BenchmarkDataset, ThreatModel
 
@@ -58,6 +62,9 @@ DEFAULT_EPS = {
     ("imagenet", "L2"): 3.0,
 }
 
+OFFICIAL_AUTOATTACK_VERSIONS = {"standard", "full"}
+CUSTOM_AUTOATTACK_VERSIONS = {"rand"}
+
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -68,13 +75,6 @@ def str2bool(v):
     if value in {"no", "false", "f", "n", "0"}:
         return False
     raise argparse.ArgumentTypeError("Boolean value expected.")
-
-
-def _format_cache_value(value):
-    text = str(value)
-    for old, new in (("/", "_"), (" ", ""), (".", "p"), ("-", "m")):
-        text = text.replace(old, new)
-    return text
 
 
 def parse_args():
@@ -127,7 +127,19 @@ def parse_args():
     parser.add_argument("--pgd-steps", "--pgd_steps", type=int, default=20, help="PGD steps.")
     parser.add_argument("--pgd-step-size", "--pgd_step_size", type=float, default=None, help="PGD step size. Defaults to 2 * eps / steps.")
     parser.add_argument("--pgd-random-start", "--pgd_random_start", type=str2bool, default=False, help="Enable random-start PGD.")
-    parser.add_argument("--autoattack-version", "--autoattack_version", default="standard", help="AutoAttack version.")
+    parser.add_argument(
+        "--autoattack-version",
+        "--autoattack_version",
+        default="standard",
+        help="AutoAttack mode. Use 'standard' or 'full' for official RobustBench benchmark(), or 'rand' for local APGD-CE/APGD-DLR.",
+    )
+    parser.add_argument(
+        "--autoattack-eot-iter",
+        "--autoattack_eot_iter",
+        type=int,
+        default=1,
+        help="EOT iterations for local 'rand' AutoAttack APGD components. Official RobustBench benchmark() ignores this.",
+    )
     parser.add_argument(
         "--use-hira",
         "--use_hira",
@@ -165,9 +177,9 @@ def parse_args():
     parser.add_argument(
         "--ranpac-selection-method",
         "--ranpac_selection_method",
-        choices=["regression", "val_acc", "both"],
-        default="both",
-        help="Which cached RanPAC head(s) to evaluate after fitting both ridge-selection variants.",
+        choices=["regression"],
+        default="regression",
+        help="Which cached RanPAC head to evaluate. Only regression-loss ridge selection is supported.",
     )
     parser.add_argument("--ranpac-cache-dir", "--ranpac_cache_dir", default="pretrained/ranpac_robustbench", help="RanPAC cache directory.")
     parser.add_argument("--output-path", "--output_path", default="", help="Optional JSON output path.")
@@ -195,6 +207,12 @@ def resolve_device(device):
     if isinstance(device, str) and device.isdigit():
         return torch.device(f"cuda:{device}")
     return torch.device(device)
+
+
+def freeze_backbone(model):
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+    return model.eval()
 
 
 def init_wandb(args):
@@ -292,8 +310,13 @@ def random_subset(dataset, n_examples, seed):
     return Subset(dataset, indices)
 
 
-def build_eval_loader(dataset, threat_model, model_name, data_dir, n_examples, seed, batch_size, num_workers, eval_split):
-    transform = get_preprocessing(BenchmarkDataset(dataset), ThreatModel(threat_model), model_name, None)
+def resolve_model_preprocessing(dataset, threat_model, model_name):
+    return get_preprocessing(BenchmarkDataset(dataset), ThreatModel(threat_model), model_name, None)
+
+
+def build_eval_loader(dataset, threat_model, model_name, data_dir, n_examples, seed, batch_size, num_workers, eval_split, transform=None):
+    if transform is None:
+        transform = resolve_model_preprocessing(dataset, threat_model, model_name)
     eval_dataset = build_dataset(dataset, eval_split, data_dir, transform)
     eval_dataset = random_subset(eval_dataset, n_examples, seed)
     return DataLoader(
@@ -386,20 +409,55 @@ def evaluate_pgd(model, loader, device, norm, eps, steps, step_size, random_star
     return correct / max(total, 1)
 
 
-def evaluate_autoattack(model, loader, device, norm, eps, version, desc):
+def evaluate_autoattack_benchmark(model, benchmark_model_name, args, eps, device, preprocessing):
     model.eval()
-    adversary = AutoAttack(model, norm=norm, eps=eps, version=version, device=device, verbose=False)
-    correct = 0
+    if args.autoattack_eot_iter != 1:
+        print(
+            "RobustBench benchmark() uses standard AutoAttack and does not expose the "
+            f"configured EOT setting; ignoring eot_iter={args.autoattack_eot_iter}."
+        )
+    clean_acc, robust_acc = benchmark(
+        model,
+        model_name=benchmark_model_name,
+        n_examples=args.eval_examples,
+        dataset=args.dataset,
+        threat_model=args.threat_model,
+        eps=eps,
+        device=device,
+        batch_size=args.eval_batch_size,
+        data_dir=args.data_dir,
+        to_disk=True,
+        preprocessing=preprocessing,
+    )
+    return clean_acc, robust_acc
+
+
+def evaluate_autoattack_rand(model, loader, device, norm, eps, eot_iter, desc):
+    if AutoAttack is None:
+        raise ImportError("autoattack is not installed. Install it or use --autoattack_version standard/full.")
+
+    model.eval()
+    adversary = AutoAttack(model, norm=norm, eps=eps, version="rand", device=device, verbose=False)
+    adversary.attacks_to_run = ["apgd-ce", "apgd-dlr"]
+    adversary.apgd.n_restarts = 1
+    adversary.apgd.eot_iter = eot_iter
+
+    clean_correct = 0
+    robust_correct = 0
     total = 0
     for inputs, targets in tqdm(loader, desc=desc, leave=False):
         inputs = inputs.to(device)
         targets = targets.to(device)
+        with torch.no_grad():
+            clean_predictions = model(inputs).argmax(1)
+        clean_correct += (clean_predictions == targets).sum().item()
         adv_inputs = adversary.run_standard_evaluation(inputs, targets, bs=inputs.size(0))
         with torch.no_grad():
-            predictions = model(adv_inputs).argmax(1)
-        correct += (predictions == targets).sum().item()
+            robust_predictions = model(adv_inputs).argmax(1)
+        robust_correct += (robust_predictions == targets).sum().item()
         total += targets.size(0)
-    return correct / max(total, 1)
+    denominator = max(total, 1)
+    return clean_correct / denominator, robust_correct / denominator
 
 
 def load_robustbench_model(model_name, dataset, threat_model, model_dir, device):
@@ -412,11 +470,38 @@ def load_robustbench_model(model_name, dataset, threat_model, model_dir, device)
     return model.to(device).eval()
 
 
-def evaluate_variant(model, variant_name, loader, attacks, args, eps, pgd_step_size, device):
-    metrics = {
-        "variant": variant_name,
-        "clean_acc": evaluate_clean(model, loader, device, desc=f"{variant_name} clean"),
-    }
+def evaluate_variant(model, variant_name, benchmark_model_name, loader, attacks, args, eps, pgd_step_size, device, preprocessing):
+    metrics = {"variant": variant_name}
+    if "autoattack" in attacks:
+        autoattack_version = args.autoattack_version.lower()
+        if autoattack_version in OFFICIAL_AUTOATTACK_VERSIONS:
+            clean_acc, autoattack_robust_acc = evaluate_autoattack_benchmark(
+                model,
+                benchmark_model_name=benchmark_model_name,
+                args=args,
+                eps=eps,
+                device=device,
+                preprocessing=preprocessing,
+            )
+        elif autoattack_version in CUSTOM_AUTOATTACK_VERSIONS:
+            clean_acc, autoattack_robust_acc = evaluate_autoattack_rand(
+                model,
+                loader,
+                device,
+                norm=args.threat_model,
+                eps=eps,
+                eot_iter=args.autoattack_eot_iter,
+                desc=f"{variant_name} autoattack_{autoattack_version}",
+            )
+        else:
+            raise ValueError(
+                f"Unsupported autoattack version '{args.autoattack_version}'. "
+                "Use one of: standard, full, rand."
+            )
+        metrics["clean_acc"] = clean_acc
+        metrics["autoattack_robust_acc"] = autoattack_robust_acc
+    else:
+        metrics["clean_acc"] = evaluate_clean(model, loader, device, desc=f"{variant_name} clean")
     if "pgd" in attacks:
         metrics["pgd_robust_acc"] = evaluate_pgd(
             model,
@@ -428,16 +513,6 @@ def evaluate_variant(model, variant_name, loader, attacks, args, eps, pgd_step_s
             step_size=pgd_step_size,
             random_start=args.pgd_random_start,
             desc=f"{variant_name} pgd",
-        )
-    if "autoattack" in attacks:
-        metrics["autoattack_robust_acc"] = evaluate_autoattack(
-            model,
-            loader,
-            device,
-            norm=args.threat_model,
-            eps=eps,
-            version=args.autoattack_version,
-            desc=f"{variant_name} autoattack",
         )
     robust_values = [metrics[key] for key in ("pgd_robust_acc", "autoattack_robust_acc") if key in metrics]
     if robust_values:
@@ -455,47 +530,32 @@ def resolve_attacks(args):
     return {attack.strip().lower() for attack in args.attacks.split(",") if attack.strip()}
 
 
-def build_hira_variant_name(base_name, args):
-    sample_tag = "full" if args.hira_max_train_samples is None or args.hira_max_train_samples < 0 else str(args.hira_max_train_samples)
-    block_tag = "" if args.hira_num_blocks == 2 else f"-blk{args.hira_num_blocks}"
-    return (
-        f"{base_name}-hira-v22-post-fc2-closedform-gelu{block_tag}"
-        f"-exp{args.hira_expansion_dim}"
-        f"-ns{sample_tag}"
-        f"-seed{args.hira_seed}"
-    )
-
-
 def resolve_variants(args):
     hira_values = [False, True] if args.use_hira is None else [args.use_hira]
     ranpac_values = [False, True] if args.use_ranpac is None else [args.use_ranpac]
-    ranpac_methods = ["regression", "val_acc"] if args.ranpac_selection_method == "both" else [args.ranpac_selection_method]
     variant_order = [
         "original",
         "hira",
         "ranpac_regression",
-        "ranpac_val_acc",
         "hira_ranpac_regression",
-        "hira_ranpac_val_acc",
     ]
     variants = []
     for use_hira in hira_values:
         for use_ranpac in ranpac_values:
-            selection_methods = ranpac_methods if use_ranpac else [None]
-            for ranpac_selection_method in selection_methods:
-                if not use_ranpac:
-                    variant = "hira" if use_hira else "original"
-                else:
-                    base_name = "hira_ranpac" if use_hira else "ranpac"
-                    variant = f"{base_name}_{ranpac_selection_method}"
-                variants.append(
-                    {
-                        "variant": variant,
-                        "use_hira": use_hira,
-                        "use_ranpac": use_ranpac,
-                        "ranpac_selection_method": ranpac_selection_method,
-                    }
-                )
+            ranpac_selection_method = args.ranpac_selection_method if use_ranpac else None
+            if not use_ranpac:
+                variant = "hira" if use_hira else "original"
+            else:
+                base_name = "hira_ranpac" if use_hira else "ranpac"
+                variant = f"{base_name}_{ranpac_selection_method}"
+            variants.append(
+                {
+                    "variant": variant,
+                    "use_hira": use_hira,
+                    "use_ranpac": use_ranpac,
+                    "ranpac_selection_method": ranpac_selection_method,
+                }
+            )
     variants.sort(key=lambda item: variant_order.index(item["variant"]))
     return variants
 
@@ -518,6 +578,7 @@ def main():
         step = 0
         for model_name in args.model_names:
             print(f"Evaluating {model_name} on {args.dataset} ({args.threat_model}), eps={eps}")
+            model_preprocessing = resolve_model_preprocessing(args.dataset, args.threat_model, model_name)
             eval_loader = build_eval_loader(
                 dataset=args.dataset,
                 threat_model=args.threat_model,
@@ -528,6 +589,7 @@ def main():
                 batch_size=args.eval_batch_size,
                 num_workers=args.num_workers,
                 eval_split=args.eval_split,
+                transform=model_preprocessing,
             )
             eval_examples = len(eval_loader.dataset)
 
@@ -557,8 +619,18 @@ def main():
                         cache_dir=args.hira_cache_dir,
                         max_train_samples=args.hira_max_train_samples,
                         force_retrain=args.hira_force_retrain,
+                        train_transform=model_preprocessing,
                     ).to(device).eval()
-                    classifier_name = build_hira_variant_name(classifier_name, args)
+                    classifier_name = build_hira_variant_name(
+                        classifier_name,
+                        expansion_dim=args.hira_expansion_dim,
+                        epochs=args.hira_epochs,
+                        lr=args.hira_lr,
+                        weight_decay=args.hira_weight_decay,
+                        max_train_samples=args.hira_max_train_samples,
+                        seed=args.hira_seed,
+                        num_adapter_blocks=args.hira_num_blocks,
+                    )
                 if variant_cfg["use_ranpac"]:
                     model = apply_ranpac_head(
                         model,
@@ -571,17 +643,22 @@ def main():
                         selection_method=variant_cfg["ranpac_selection_method"],
                         device=device,
                         cache_dir=args.ranpac_cache_dir,
+                        train_transform=model_preprocessing,
                     ).to(device).eval()
+                model = freeze_backbone(model).to(device).eval()
+                benchmark_model_name = f"{model_name}-{variant_cfg['variant']}"
 
                 metrics = evaluate_variant(
                     model,
                     variant_name=variant_cfg["variant"],
+                    benchmark_model_name=benchmark_model_name,
                     loader=eval_loader,
                     attacks=attacks,
                     args=args,
                     eps=eps,
                     pgd_step_size=pgd_step_size,
                     device=device,
+                    preprocessing=model_preprocessing,
                 )
                 metrics.update(
                     {
