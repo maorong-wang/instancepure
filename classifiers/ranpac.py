@@ -10,7 +10,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
 
 RIDGE_CANDIDATES = [10.0 ** power for power in range(-8, 14)]
-RANPAC_CACHE_VERSION = 4
+RANPAC_CACHE_VERSION = 6
 
 
 class RanPACLinear(nn.Module):
@@ -273,6 +273,7 @@ def _fit_ranpac_state(
         "split_seed": seed,
         "ridge_candidates": RIDGE_CANDIDATES,
         "selection_method": "regression",
+        "target_type": "ground_truth",
         "ridge": regression_ridge,
         "weight": weight,
         "w_rand": w_rand,

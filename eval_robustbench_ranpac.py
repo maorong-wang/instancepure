@@ -62,8 +62,8 @@ DEFAULT_EPS = {
     ("imagenet", "L2"): 3.0,
 }
 
-OFFICIAL_AUTOATTACK_VERSIONS = {"standard", "full"}
-CUSTOM_AUTOATTACK_VERSIONS = {"rand"}
+OFFICIAL_AUTOATTACK_VERSIONS = {"standard"}
+CUSTOM_AUTOATTACK_VERSIONS = {"rand", "full", "apgdt"}
 
 
 def str2bool(v):
@@ -131,7 +131,7 @@ def parse_args():
         "--autoattack-version",
         "--autoattack_version",
         default="standard",
-        help="AutoAttack mode. Use 'standard' or 'full' for official RobustBench benchmark(), or 'rand' for local APGD-CE/APGD-DLR.",
+        help="AutoAttack mode. Use 'standard' for official RobustBench benchmark(), 'full' for local APGD-CE/APGD-DLR/FAB/Square, 'rand' for local APGD-CE/APGD-DLR, or 'apgdt' for local APGD-T with RobustBench-standard targeted settings.",
     )
     parser.add_argument(
         "--autoattack-eot-iter",
@@ -432,32 +432,61 @@ def evaluate_autoattack_benchmark(model, benchmark_model_name, args, eps, device
     return clean_acc, robust_acc
 
 
-def evaluate_autoattack_rand(model, loader, device, norm, eps, eot_iter, desc):
+def _loader_to_tensors(loader, desc):
+    input_batches = []
+    target_batches = []
+    for inputs, targets in tqdm(loader, desc=desc, leave=False):
+        input_batches.append(inputs.cpu())
+        target_batches.append(targets.cpu())
+    if not input_batches:
+        raise ValueError("AutoAttack evaluation loader is empty.")
+    return torch.cat(input_batches, dim=0), torch.cat(target_batches, dim=0)
+
+
+def _tensor_accuracy(model, inputs, targets, batch_size, device):
+    model.eval()
+    correct = 0
+    total = inputs.size(0)
+    with torch.no_grad():
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            batch_inputs = inputs[start:end].to(device)
+            batch_targets = targets[start:end].to(device)
+            predictions = model(batch_inputs).argmax(1)
+            correct += (predictions == batch_targets).sum().item()
+    return correct / max(total, 1)
+
+
+def evaluate_autoattack_custom(model, loader, device, norm, eps, version, eot_iter, batch_size, desc):
     if AutoAttack is None:
-        raise ImportError("autoattack is not installed. Install it or use --autoattack_version standard/full.")
+        raise ImportError("autoattack is not installed. Install it or use --autoattack_version standard.")
 
     model.eval()
-    adversary = AutoAttack(model, norm=norm, eps=eps, version="rand", device=device, verbose=False)
-    adversary.attacks_to_run = ["apgd-ce", "apgd-dlr"]
-    adversary.apgd.n_restarts = 1
-    adversary.apgd.eot_iter = eot_iter
+    clean_inputs, clean_targets = _loader_to_tensors(loader, desc=f"{desc}_materialize")
+    adversary = AutoAttack(model, norm=norm, eps=eps, version="custom", device=device, verbose=False)
 
-    clean_correct = 0
-    robust_correct = 0
-    total = 0
-    for inputs, targets in tqdm(loader, desc=desc, leave=False):
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-        with torch.no_grad():
-            clean_predictions = model(inputs).argmax(1)
-        clean_correct += (clean_predictions == targets).sum().item()
-        adv_inputs = adversary.run_standard_evaluation(inputs, targets, bs=inputs.size(0))
-        with torch.no_grad():
-            robust_predictions = model(adv_inputs).argmax(1)
-        robust_correct += (robust_predictions == targets).sum().item()
-        total += targets.size(0)
-    denominator = max(total, 1)
-    return clean_correct / denominator, robust_correct / denominator
+    if version == "rand":
+        adversary.attacks_to_run = ["apgd-ce", "apgd-dlr"]
+        adversary.apgd.n_restarts = 1
+        adversary.apgd.eot_iter = eot_iter
+    elif version == "full":
+        adversary.attacks_to_run = ["apgd-ce", "apgd-dlr", "fab", "square"]
+    elif version == "apgdt":
+        adversary.attacks_to_run = ["apgd-t"]
+        if norm in {"Linf", "L2"}:
+            adversary.apgd_targeted.n_restarts = 1
+            adversary.apgd_targeted.n_target_classes = 9
+        else:
+            adversary.apgd_targeted.use_largereps = True
+            adversary.apgd_targeted.n_target_classes = 5
+        adversary.apgd_targeted.eot_iter = 1
+    else:
+        raise ValueError(f"Unsupported local autoattack version '{version}'.")
+
+    clean_acc = _tensor_accuracy(model, clean_inputs, clean_targets, batch_size=batch_size, device=device)
+    adv_inputs = adversary.run_standard_evaluation(clean_inputs, clean_targets, bs=batch_size)
+    robust_acc = _tensor_accuracy(model, adv_inputs.cpu(), clean_targets, batch_size=batch_size, device=device)
+    return clean_acc, robust_acc
 
 
 def load_robustbench_model(model_name, dataset, threat_model, model_dir, device):
@@ -484,19 +513,21 @@ def evaluate_variant(model, variant_name, benchmark_model_name, loader, attacks,
                 preprocessing=preprocessing,
             )
         elif autoattack_version in CUSTOM_AUTOATTACK_VERSIONS:
-            clean_acc, autoattack_robust_acc = evaluate_autoattack_rand(
+            clean_acc, autoattack_robust_acc = evaluate_autoattack_custom(
                 model,
                 loader,
                 device,
                 norm=args.threat_model,
                 eps=eps,
+                version=autoattack_version,
                 eot_iter=args.autoattack_eot_iter,
+                batch_size=args.eval_batch_size,
                 desc=f"{variant_name} autoattack_{autoattack_version}",
             )
         else:
             raise ValueError(
                 f"Unsupported autoattack version '{args.autoattack_version}'. "
-                "Use one of: standard, full, rand."
+                "Use one of: standard, full, rand, apgdt."
             )
         metrics["clean_acc"] = clean_acc
         metrics["autoattack_robust_acc"] = autoattack_robust_acc
@@ -682,11 +713,12 @@ def main():
                     torch.cuda.empty_cache()
 
         log_wandb_results_table(wandb_run, results)
-        print(json.dumps(results, indent=2))
+        output_payload = results
+        print(json.dumps(output_payload, indent=2))
         if args.output_path:
             output_path = Path(args.output_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(json.dumps(results, indent=2) + "\n")
+            output_path.write_text(json.dumps(output_payload, indent=2) + "\n")
     finally:
         finish_wandb(wandb_run)
 

@@ -1,6 +1,6 @@
 program: eval_robustbench_ranpac.py
 method: grid
-project: robustbench-ranpac-hira-rc-2models_aa
+project: robustbench-ranpac-hira-rc-2models_aa_apgdt
 name: robustbench-ranpac-hira-imagenet
 metric:
   name: robust_acc
@@ -39,7 +39,7 @@ parameters:
   pgd_random_start:
     value: true
   autoattack_version:
-    value: standard
+    values: [apgdt]
   hira_expansion_dim:
     values: [32768]
   hira_num_blocks:
@@ -65,7 +65,7 @@ parameters:
   hira_force_retrain:
     value: false
   ranpac_rp_dim:
-    values: [8192, 10000]
+    values: [10000]
   ranpac_fit_batch_size:
     value: 256
   ranpac_cache_dir:
