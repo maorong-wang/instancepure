@@ -72,6 +72,9 @@ def parse_args():
     parser.add_argument("--hira_dataset_root", type=str, default=None, help="ImageNet root used when fitting closed-form HiRA weights")
     parser.add_argument("--hira_max_train_samples", type=int, default=-1, help="optional cap on ImageNet train samples used to fit closed-form HiRA")
     parser.add_argument("--hira_force_retrain", type=str2bool, default=False, help="ignore cached HiRA weights and fit again")
+    parser.add_argument("--adapt_noise_eps", type=float, default=0.0, help="Linf noise radius used while fitting HiRA and RanPAC adaptation statistics")
+    parser.add_argument("--adapt_noise_num", type=int, default=0, help="number of noisy samples per training image used while fitting HiRA and RanPAC")
+    parser.add_argument("--adapt_alpha", type=float, default=1.0, help="total weight assigned to noisy adaptation statistics relative to clean statistics")
     parser.add_argument("--attack_method", default="Linf_pgd", type=str, help="attack model")
     parser.add_argument("--device", default="cuda:0", help="device, e.g. cuda:0")
     parser.add_argument("--use_ranpac_head", type=str2bool, default=False, help="replace the final linear layer with a RanPAC ridge head")
@@ -79,6 +82,7 @@ def parse_args():
     parser.add_argument("--ranpac_batch_size", type=int, default=256, help="batch size used to fit the RanPAC head")
     parser.add_argument("--ranpac_num_workers", type=int, default=8, help="number of workers used to fit the RanPAC head")
     parser.add_argument("--ranpac_seed", type=int, default=0, help="seed used to build the RanPAC random projection")
+    parser.add_argument("--ranpac_lambda", type=float, default=1.0, help="residual weight for the RanPAC branch added on top of the original classifier head")
     parser.add_argument(
         "--ranpac_selection_method",
         type=str,
@@ -117,6 +121,23 @@ def resolve_device(device):
     if isinstance(device, str) and device.isdigit():
         return torch.device(f"cuda:{device}")
     return torch.device(device)
+
+
+def _format_variant_noise_value(value):
+    text = str(value)
+    for old, new in (("/", "_"), (" ", ""), (".", "p"), ("-", "m")):
+        text = text.replace(old, new)
+    return text
+
+
+def build_adapt_noise_tag(args):
+    if args.adapt_noise_eps <= 0 or args.adapt_noise_num <= 0 or args.adapt_alpha <= 0:
+        return ""
+    return (
+        f"_neps{_format_variant_noise_value(args.adapt_noise_eps)}"
+        f"_nnum{args.adapt_noise_num}"
+        f"_na{_format_variant_noise_value(args.adapt_alpha)}"
+    )
 
 
 def load_diffpure_stadv_attack():
@@ -381,12 +402,17 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
     pgd_conf = gen_pgd_confs(eps=eps, alpha=alpha, iter=iter, input_range=(0, 1))
     device = resolve_device(device)
     classifier_variant = classifier
+    adapt_noise_tag = build_adapt_noise_tag(args)
     if args.use_hira_adapter:
         classifier_variant = f"{classifier_variant}_hira"
         if args.hira_num_blocks != 2:
             classifier_variant = f"{classifier_variant}_blk{args.hira_num_blocks}"
     if args.use_ranpac_head:
         classifier_variant = f"{classifier_variant}_ranpac_{args.ranpac_selection_method}"
+        if args.ranpac_lambda != 1.0:
+            classifier_variant = f"{classifier_variant}_lam{_format_variant_noise_value(args.ranpac_lambda)}"
+    if adapt_noise_tag and (args.use_hira_adapter or args.use_ranpac_head):
+        classifier_variant = f"{classifier_variant}{adapt_noise_tag}"
     lora_dir = args.lora_input_dir or "no_lora"
 
     if args.load_origin_lora:
@@ -419,12 +445,16 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         hira_dataset_root=args.hira_dataset_root,
         hira_max_train_samples=args.hira_max_train_samples,
         hira_force_retrain=args.hira_force_retrain,
+        adapt_noise_eps=args.adapt_noise_eps,
+        adapt_noise_num=args.adapt_noise_num,
+        adapt_alpha=args.adapt_alpha,
         use_ranpac=args.use_ranpac_head,
         ranpac_rp_dim=args.ranpac_rp_dim,
         ranpac_batch_size=args.ranpac_batch_size,
         ranpac_num_workers=args.ranpac_num_workers,
         ranpac_seed=args.ranpac_seed,
         ranpac_selection_method=args.ranpac_selection_method,
+        ranpac_lambda=args.ranpac_lambda,
         ranpac_cache_dir=args.ranpac_cache_dir,
         ranpac_dataset_root=args.ranpac_dataset_root,
         device=device,
@@ -547,6 +577,10 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         "clean_typical_accuracy": clean_typical_accuracy / num_eval_samples,
         "typical_accuracy": typical_accuracy / num_eval_samples,
         "evaluated_examples": i - 1,
+        "adapt_noise_eps": args.adapt_noise_eps,
+        "adapt_noise_num": args.adapt_noise_num,
+        "adapt_alpha": args.adapt_alpha,
+        "ranpac_lambda": args.ranpac_lambda,
     }
 
     stat = pd.DataFrame(metrics, index=[0])

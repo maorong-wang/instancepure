@@ -1,6 +1,6 @@
 program: eval_robustbench_ranpac.py
 method: grid
-project: robustbench-ranpac-hira-rc-2models_aa_apgdt
+project: robustbench-ranpac-hira-rc-2models_aa_noise
 name: robustbench-ranpac-hira-imagenet
 metric:
   name: robust_acc
@@ -17,7 +17,6 @@ parameters:
   model_names:
     values:
       - Liu2023Comprehensive_Swin-L
-      - Xu2024MIMIR_Swin-L
   use_hira:
     values: [false, true]
   use_ranpac:
@@ -25,7 +24,7 @@ parameters:
   attack_method:
     values: [autoattack]
   eval_examples:
-    value: 5000
+    value: 256
   eval_split:
     value: test
   eval_batch_size:
@@ -64,8 +63,16 @@ parameters:
     values: [100000]
   hira_force_retrain:
     value: false
+  adapt_noise_eps:
+    value: 0.04705882352
+  adapt_noise_num:
+    value: 1
+  adapt_alpha:
+    value: 1
   ranpac_rp_dim:
     values: [10000]
+  ranpac_lambda:
+    value: 1.0
   ranpac_fit_batch_size:
     value: 256
   ranpac_cache_dir:

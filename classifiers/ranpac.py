@@ -10,7 +10,14 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
 
 RIDGE_CANDIDATES = [10.0 ** power for power in range(-8, 14)]
-RANPAC_CACHE_VERSION = 6
+RANPAC_CACHE_VERSION = 8
+
+
+def _format_cache_value(value):
+    text = str(value)
+    for old, new in (("/", "_"), (" ", ""), (".", "p"), ("-", "m")):
+        text = text.replace(old, new)
+    return text
 
 
 class RanPACLinear(nn.Module):
@@ -26,6 +33,17 @@ class RanPACLinear(nn.Module):
         x = x.view(x.size(0), -1)
         projected = F.gelu(x @ self.w_rand)
         return projected @ self.weight.t()
+
+
+class ResidualRanPACLinear(nn.Module):
+    def __init__(self, original_linear, ranpac_linear, ranpac_lambda):
+        super().__init__()
+        self.original_linear = original_linear
+        self.ranpac_linear = ranpac_linear
+        self.ranpac_lambda = float(ranpac_lambda)
+
+    def forward(self, x):
+        return self.original_linear(x) + self.ranpac_lambda * self.ranpac_linear(x)
 
 
 def _get_module_by_name(model, module_name):
@@ -125,7 +143,23 @@ def _build_train_loaders(classifier_name, dataset_root, batch_size, num_workers,
     raise NotImplementedError(f"RanPAC train loader is not implemented for {classifier_name}.")
 
 
-def _accumulate_statistics(model, linear_layer, loader, w_rand, out_features, device, description):
+def _sample_linf_noisy_inputs(inputs, eps):
+    noise = torch.empty_like(inputs).uniform_(-eps, eps)
+    return torch.clamp(inputs + noise, 0.0, 1.0)
+
+
+def _accumulate_statistics(
+    model,
+    linear_layer,
+    loader,
+    w_rand,
+    out_features,
+    device,
+    description,
+    adapt_noise_eps,
+    adapt_noise_num,
+    adapt_alpha,
+):
     feature_buffer = []
 
     def hook(_, inputs):
@@ -136,22 +170,40 @@ def _accumulate_statistics(model, linear_layer, loader, w_rand, out_features, de
     q_matrix = torch.zeros(w_rand.size(1), out_features, dtype=torch.float32)
     target_norm = 0.0
     sample_count = 0
+    del adapt_alpha
+    use_noisy_adaptation = adapt_noise_num > 0 and adapt_noise_eps > 0
+    noisy_sample_weight = 1.0 / adapt_noise_num if use_noisy_adaptation else 0.0
 
     try:
         with torch.no_grad():
             for inputs, targets in tqdm(loader, desc=description):
                 inputs = inputs.to(device)
                 targets = targets.to(device)
-                feature_buffer.clear()
-                _ = model(inputs)
-                features = feature_buffer.pop().view(inputs.size(0), -1).cpu()
-                projected = F.gelu(features @ w_rand)
                 onehot = F.one_hot(targets.cpu(), num_classes=out_features).float()
+                target_norm_value = onehot.square().sum().item()
 
-                g_matrix += projected.t() @ projected
-                q_matrix += projected.t() @ onehot
-                target_norm += onehot.square().sum().item()
-                sample_count += onehot.size(0)
+                if use_noisy_adaptation:
+                    for _ in range(adapt_noise_num):
+                        noisy_inputs = _sample_linf_noisy_inputs(inputs, adapt_noise_eps)
+                        feature_buffer.clear()
+                        _ = model(noisy_inputs)
+                        noisy_features = feature_buffer.pop().view(inputs.size(0), -1).cpu()
+                        noisy_projected = F.gelu(noisy_features @ w_rand)
+
+                        g_matrix += noisy_sample_weight * (noisy_projected.t() @ noisy_projected)
+                        q_matrix += noisy_sample_weight * (noisy_projected.t() @ onehot)
+                        target_norm += noisy_sample_weight * target_norm_value
+                        sample_count += noisy_sample_weight * onehot.size(0)
+                else:
+                    feature_buffer.clear()
+                    _ = model(inputs)
+                    features = feature_buffer.pop().view(inputs.size(0), -1).cpu()
+                    projected = F.gelu(features @ w_rand)
+
+                    g_matrix += projected.t() @ projected
+                    q_matrix += projected.t() @ onehot
+                    target_norm += target_norm_value
+                    sample_count += onehot.size(0)
     finally:
         handle.remove()
 
@@ -199,6 +251,9 @@ def _fit_ranpac_state(
     train_loader=None,
     val_loader=None,
     train_transform=None,
+    adapt_noise_eps=0.0,
+    adapt_noise_num=0,
+    adapt_alpha=1.0,
 ):
     layer_name, linear_layer = _find_last_linear(model)
     in_features = linear_layer.in_features
@@ -227,6 +282,9 @@ def _fit_ranpac_state(
         out_features,
         device,
         description="RanPAC train stats",
+        adapt_noise_eps=adapt_noise_eps,
+        adapt_noise_num=adapt_noise_num,
+        adapt_alpha=adapt_alpha,
     )
     if val_loader is not None:
         g_val, q_val, val_target_norm, val_sample_count = _accumulate_statistics(
@@ -237,6 +295,9 @@ def _fit_ranpac_state(
             out_features,
             device,
             description="RanPAC val stats",
+            adapt_noise_eps=adapt_noise_eps,
+            adapt_noise_num=adapt_noise_num,
+            adapt_alpha=adapt_alpha,
         )
     else:
         g_val = torch.zeros_like(g_train)
@@ -274,6 +335,10 @@ def _fit_ranpac_state(
         "ridge_candidates": RIDGE_CANDIDATES,
         "selection_method": "regression",
         "target_type": "ground_truth",
+        "adaptation_input_source": "noisy_only" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "clean_only",
+        "adapt_noise_eps": adapt_noise_eps,
+        "adapt_noise_num": adapt_noise_num,
+        "adapt_alpha": adapt_alpha,
         "ridge": regression_ridge,
         "weight": weight,
         "w_rand": w_rand,
@@ -300,18 +365,38 @@ def apply_ranpac_head(
     train_loader=None,
     val_loader=None,
     train_transform=None,
+    adapt_noise_eps=0.0,
+    adapt_noise_num=0,
+    adapt_alpha=1.0,
+    ranpac_lambda=1.0,
 ):
     if train_loader is None and "imagenet" not in classifier_name:
         raise NotImplementedError("RanPAC head replacement is currently implemented for ImageNet classifiers only.")
     if selection_method != "regression":
         raise ValueError(f"Unsupported RanPAC selection method '{selection_method}'.")
+    if adapt_noise_eps < 0:
+        raise ValueError("RanPAC adapt_noise_eps must be non-negative.")
+    if adapt_noise_num < 0:
+        raise ValueError("RanPAC adapt_noise_num must be non-negative.")
+    if adapt_alpha < 0:
+        raise ValueError("RanPAC adapt_alpha must be non-negative.")
+    if ranpac_lambda < 0:
+        raise ValueError("RanPAC ranpac_lambda must be non-negative.")
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(device)
 
-    cache_name = f"{classifier_name.replace('/', '_')}_rp{rp_dim}_seed{seed}_ranpac_v{RANPAC_CACHE_VERSION}.pt"
+    noise_tag = (
+        f"_neps{_format_cache_value(adapt_noise_eps)}"
+        f"_nnum{adapt_noise_num}"
+        f"_na{_format_cache_value(adapt_alpha)}"
+    )
+    cache_name = (
+        f"{classifier_name.replace('/', '_')}_rp{rp_dim}_seed{seed}"
+        f"{noise_tag}_ranpac_v{RANPAC_CACHE_VERSION}.pt"
+    )
     cache_path = os.path.join(cache_dir, cache_name)
 
     layer_name, linear_layer = _find_last_linear(model)
@@ -331,6 +416,9 @@ def apply_ranpac_head(
                 train_loader=train_loader,
                 val_loader=val_loader,
                 train_transform=train_transform,
+                adapt_noise_eps=adapt_noise_eps,
+                adapt_noise_num=adapt_noise_num,
+                adapt_alpha=adapt_alpha,
             )
     else:
         state = _fit_ranpac_state(
@@ -346,6 +434,9 @@ def apply_ranpac_head(
             train_loader=train_loader,
             val_loader=val_loader,
             train_transform=train_transform,
+            adapt_noise_eps=adapt_noise_eps,
+            adapt_noise_num=adapt_noise_num,
+            adapt_alpha=adapt_alpha,
         )
 
     if state["layer_name"] != layer_name:
@@ -353,12 +444,17 @@ def apply_ranpac_head(
     if state["in_features"] != linear_layer.in_features or state["out_features"] != linear_layer.out_features:
         raise ValueError("Cached RanPAC head does not match the pretrained classifier dimensions.")
 
-    ranpac_head = RanPACLinear(
+    ranpac_branch = RanPACLinear(
         in_features=state["in_features"],
         out_features=state["out_features"],
         rp_dim=state["rp_dim"],
         weight=state["weight"],
         w_rand=state["w_rand"],
+    )
+    ranpac_head = ResidualRanPACLinear(
+        original_linear=linear_layer,
+        ranpac_linear=ranpac_branch,
+        ranpac_lambda=ranpac_lambda,
     )
     _set_module_by_name(model, layer_name, ranpac_head)
     return model

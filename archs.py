@@ -159,12 +159,16 @@ def get_archs(
     hira_dataset_root=None,
     hira_max_train_samples=-1,
     hira_force_retrain=False,
+    adapt_noise_eps=0.0,
+    adapt_noise_num=0,
+    adapt_alpha=1.0,
     use_ranpac=False,
     ranpac_rp_dim=5000,
     ranpac_batch_size=256,
     ranpac_num_workers=4,
     ranpac_seed=0,
     ranpac_selection_method="regression",
+    ranpac_lambda=1.0,
     ranpac_cache_dir="pretrained/ranpac",
     ranpac_dataset_root=None,
     device=None,
@@ -196,6 +200,9 @@ def get_archs(
             cache_dir=hira_cache_dir,
             max_train_samples=hira_max_train_samples,
             force_retrain=hira_force_retrain,
+            adapt_noise_eps=adapt_noise_eps,
+            adapt_noise_num=adapt_noise_num,
+            adapt_alpha=adapt_alpha,
         )
         classifier_name = build_hira_variant_name(
             classifier_name,
@@ -206,6 +213,9 @@ def get_archs(
             max_train_samples=hira_max_train_samples,
             seed=hira_seed,
             num_adapter_blocks=hira_num_blocks,
+            adapt_noise_eps=adapt_noise_eps,
+            adapt_noise_num=adapt_noise_num,
+            adapt_alpha=adapt_alpha,
         )
 
     if use_ranpac:
@@ -220,6 +230,10 @@ def get_archs(
             selection_method=ranpac_selection_method,
             device=device,
             cache_dir=ranpac_cache_dir,
+            adapt_noise_eps=adapt_noise_eps,
+            adapt_noise_num=adapt_noise_num,
+            adapt_alpha=adapt_alpha,
+            ranpac_lambda=ranpac_lambda,
         )
 
     return classifier

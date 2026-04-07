@@ -50,8 +50,16 @@ parameters:
     value: -1
   hira_force_retrain:
     value: false
+  adapt_noise_eps:
+    value: 0.0
+  adapt_noise_num:
+    value: 0
+  adapt_alpha:
+    value: 1.0
   ranpac_rp_dim:
     value: 8192
+  ranpac_lambda:
+    value: 1.0
   ranpac_batch_size:
     value: 256
   ranpac_num_workers:

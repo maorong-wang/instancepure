@@ -159,6 +159,9 @@ def parse_args():
     parser.add_argument("--hira-dataset-root", "--hira_dataset_root", default="", help="Optional ImageNet root used to fit closed-form HiRA. Defaults to --data-dir.")
     parser.add_argument("--hira-max-train-samples", "--hira_max_train_samples", type=int, default=-1, help="Optional cap on ImageNet train samples used to fit closed-form HiRA.")
     parser.add_argument("--hira-force-retrain", "--hira_force_retrain", type=str2bool, default=False, help="Ignore cached HiRA weights and fit again.")
+    parser.add_argument("--adapt-noise-eps", "--adapt_noise_eps", type=float, default=0.0, help="Linf noise radius used while fitting HiRA and RanPAC adaptation statistics.")
+    parser.add_argument("--adapt-noise-num", "--adapt_noise_num", type=int, default=0, help="Number of noisy samples per training image used while fitting HiRA and RanPAC.")
+    parser.add_argument("--adapt-alpha", "--adapt_alpha", type=float, default=1.0, help="Total weight assigned to noisy adaptation statistics relative to clean statistics.")
     parser.add_argument(
         "--use-ranpac",
         "--use_ranpac",
@@ -181,7 +184,21 @@ def parse_args():
         default="regression",
         help="Which cached RanPAC head to evaluate. Only regression-loss ridge selection is supported.",
     )
+    parser.add_argument(
+        "--ranpac-lambda",
+        "--ranpac_lambda",
+        type=float,
+        default=1.0,
+        help="Residual weight for the RanPAC branch added on top of the original classifier head.",
+    )
     parser.add_argument("--ranpac-cache-dir", "--ranpac_cache_dir", default="pretrained/ranpac_robustbench", help="RanPAC cache directory.")
+    parser.add_argument(
+        "--diagnostic-topk",
+        "--diagnostic_topk",
+        type=int,
+        default=9,
+        help="Top-k confusing classes used for RanPAC targeted-margin and rank-preservation diagnostics.",
+    )
     parser.add_argument("--output-path", "--output_path", default="", help="Optional JSON output path.")
     parser.add_argument("--use-wandb", "--use_wandb", type=str2bool, default=False, help="Log evaluation metrics to Weights & Biases.")
     parser.add_argument("--wandb-project", "--wandb_project", default="robustbench-ranpac", help="Weights & Biases project name.")
@@ -457,6 +474,106 @@ def _tensor_accuracy(model, inputs, targets, batch_size, device):
     return correct / max(total, 1)
 
 
+def _collect_logits(model, loader, device, desc):
+    model.eval()
+    logits_batches = []
+    target_batches = []
+    with torch.no_grad():
+        for inputs, targets in tqdm(loader, desc=desc, leave=False):
+            inputs = inputs.to(device)
+            logits_batches.append(model(inputs).float().cpu())
+            target_batches.append(targets.cpu())
+    if not logits_batches:
+        raise ValueError("Diagnostic loader is empty.")
+    return torch.cat(logits_batches, dim=0), torch.cat(target_batches, dim=0)
+
+
+def _confusing_class_order(logits, targets):
+    masked_logits = logits.clone()
+    masked_logits[torch.arange(masked_logits.size(0)), targets] = float("-inf")
+    return masked_logits.argsort(dim=1, descending=True)
+
+
+def _compute_ranpac_diagnostics(reference_logits, variant_logits, targets, topk):
+    if reference_logits.shape != variant_logits.shape:
+        raise ValueError("Reference and variant logits must have identical shapes for diagnostics.")
+    if targets.ndim != 1 or targets.size(0) != reference_logits.size(0):
+        raise ValueError("Targets must be a 1D tensor aligned with the diagnostic logits.")
+
+    reference_predictions = reference_logits.argmax(dim=1)
+    variant_predictions = variant_logits.argmax(dim=1)
+    joint_correct_mask = (reference_predictions == targets) & (variant_predictions == targets)
+
+    metrics = {
+        "diagnostic_num_samples": int(targets.size(0)),
+        "diagnostic_joint_clean_count": int(joint_correct_mask.sum().item()),
+    }
+    if not joint_correct_mask.any():
+        return metrics
+
+    reference_logits = reference_logits[joint_correct_mask]
+    variant_logits = variant_logits[joint_correct_mask]
+    targets = targets[joint_correct_mask]
+    topk = min(topk, reference_logits.size(1) - 1)
+    if topk <= 0:
+        return metrics
+
+    reference_order = _confusing_class_order(reference_logits, targets)
+    variant_order = _confusing_class_order(variant_logits, targets)
+    reference_topk = reference_order[:, :topk]
+    variant_topk = variant_order[:, :topk]
+
+    target_positions = torch.arange(topk, dtype=torch.float32).view(1, -1)
+    variant_positions = torch.empty_like(variant_order)
+    variant_positions.scatter_(
+        1,
+        variant_order,
+        torch.arange(variant_order.size(1), dtype=torch.long).view(1, -1).expand_as(variant_order),
+    )
+
+    true_logits_reference = reference_logits.gather(1, targets.view(-1, 1))
+    true_logits_variant = variant_logits.gather(1, targets.view(-1, 1))
+    reference_target_logits_reference = reference_logits.gather(1, reference_topk)
+    reference_target_logits_variant = variant_logits.gather(1, reference_topk)
+    variant_target_logits_variant = variant_logits.gather(1, variant_topk)
+
+    overlap = (reference_topk.unsqueeze(2) == variant_topk.unsqueeze(1)).any(dim=2).float()
+    rank_shift = (
+        variant_positions.gather(1, reference_topk).float() - target_positions
+    ).abs()
+
+    metrics.update(
+        {
+            f"apgdt_ref_targets_margin_before_top{topk}": (
+                true_logits_reference - reference_target_logits_reference
+            ).mean().item(),
+            f"apgdt_ref_targets_margin_after_top{topk}": (
+                true_logits_variant - reference_target_logits_variant
+            ).mean().item(),
+            f"apgdt_self_targets_margin_after_top{topk}": (
+                true_logits_variant - variant_target_logits_variant
+            ).mean().item(),
+            "apgdt_ref_target1_margin_before": (
+                true_logits_reference - reference_target_logits_reference[:, :1]
+            ).mean().item(),
+            "apgdt_ref_target1_margin_after": (
+                true_logits_variant - reference_target_logits_variant[:, :1]
+            ).mean().item(),
+            f"confusing_top{topk}_overlap": overlap.mean().item(),
+            "confusing_top1_preservation": (reference_topk[:, 0] == variant_topk[:, 0]).float().mean().item(),
+            f"confusing_top{topk}_ordered_match": (reference_topk == variant_topk).all(dim=1).float().mean().item(),
+            f"confusing_top{topk}_rank_shift_mean": rank_shift.mean().item(),
+        }
+    )
+    metrics[f"apgdt_ref_targets_margin_delta_top{topk}"] = (
+        metrics[f"apgdt_ref_targets_margin_after_top{topk}"] - metrics[f"apgdt_ref_targets_margin_before_top{topk}"]
+    )
+    metrics["apgdt_ref_target1_margin_delta"] = (
+        metrics["apgdt_ref_target1_margin_after"] - metrics["apgdt_ref_target1_margin_before"]
+    )
+    return metrics
+
+
 def evaluate_autoattack_custom(model, loader, device, norm, eps, version, eot_iter, batch_size, desc):
     if AutoAttack is None:
         raise ImportError("autoattack is not installed. Install it or use --autoattack_version standard.")
@@ -633,6 +750,8 @@ def main():
                     device=device,
                 )
                 classifier_name = f"{args.dataset}_{args.threat_model}_{model_name}"
+                reference_logits = None
+                reference_targets = None
                 if variant_cfg["use_hira"]:
                     model = apply_hira_adaptation(
                         model,
@@ -651,6 +770,9 @@ def main():
                         max_train_samples=args.hira_max_train_samples,
                         force_retrain=args.hira_force_retrain,
                         train_transform=model_preprocessing,
+                        adapt_noise_eps=args.adapt_noise_eps,
+                        adapt_noise_num=args.adapt_noise_num,
+                        adapt_alpha=args.adapt_alpha,
                     ).to(device).eval()
                     classifier_name = build_hira_variant_name(
                         classifier_name,
@@ -661,8 +783,17 @@ def main():
                         max_train_samples=args.hira_max_train_samples,
                         seed=args.hira_seed,
                         num_adapter_blocks=args.hira_num_blocks,
+                        adapt_noise_eps=args.adapt_noise_eps,
+                        adapt_noise_num=args.adapt_noise_num,
+                        adapt_alpha=args.adapt_alpha,
                     )
                 if variant_cfg["use_ranpac"]:
+                    reference_logits, reference_targets = _collect_logits(
+                        model,
+                        eval_loader,
+                        device,
+                        desc=f"{variant_cfg['variant']} pre_ranpac_logits",
+                    )
                     model = apply_ranpac_head(
                         model,
                         classifier_name=classifier_name,
@@ -675,9 +806,15 @@ def main():
                         device=device,
                         cache_dir=args.ranpac_cache_dir,
                         train_transform=model_preprocessing,
+                        adapt_noise_eps=args.adapt_noise_eps,
+                        adapt_noise_num=args.adapt_noise_num,
+                        adapt_alpha=args.adapt_alpha,
+                        ranpac_lambda=args.ranpac_lambda,
                     ).to(device).eval()
                 model = freeze_backbone(model).to(device).eval()
                 benchmark_model_name = f"{model_name}-{variant_cfg['variant']}"
+                if variant_cfg["use_ranpac"] and args.ranpac_lambda != 1.0:
+                    benchmark_model_name = f"{benchmark_model_name}-lam{str(args.ranpac_lambda).replace('/', '_')}"
 
                 metrics = evaluate_variant(
                     model,
@@ -691,6 +828,23 @@ def main():
                     device=device,
                     preprocessing=model_preprocessing,
                 )
+                if variant_cfg["use_ranpac"]:
+                    variant_logits, variant_targets = _collect_logits(
+                        model,
+                        eval_loader,
+                        device,
+                        desc=f"{variant_cfg['variant']} post_ranpac_logits",
+                    )
+                    if not torch.equal(reference_targets, variant_targets):
+                        raise ValueError("Diagnostic targets changed between pre- and post-RanPAC logits.")
+                    metrics.update(
+                        _compute_ranpac_diagnostics(
+                            reference_logits,
+                            variant_logits,
+                            reference_targets,
+                            topk=args.diagnostic_topk,
+                        )
+                    )
                 metrics.update(
                     {
                         "model_name": model_name,
@@ -703,6 +857,10 @@ def main():
                         "hira_num_blocks": args.hira_num_blocks if variant_cfg["use_hira"] else None,
                         "use_ranpac": variant_cfg["use_ranpac"],
                         "ranpac_selection_method": variant_cfg["ranpac_selection_method"],
+                        "ranpac_lambda": args.ranpac_lambda,
+                        "adapt_noise_eps": args.adapt_noise_eps,
+                        "adapt_noise_num": args.adapt_noise_num,
+                        "adapt_alpha": args.adapt_alpha,
                     }
                 )
                 results.append(metrics)

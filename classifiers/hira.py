@@ -14,7 +14,14 @@ from classifiers.ranpac import RIDGE_CANDIDATES
 from dataset import get_dataset
 
 
-HIRA_CACHE_VERSION = 24
+HIRA_CACHE_VERSION = 26
+
+
+def _format_cache_value(value):
+    text = str(value)
+    for old, new in (("/", "_"), (" ", ""), (".", "p"), ("-", "m")):
+        text = text.replace(old, new)
+    return text
 
 
 class HiRAHalfPrecisionWrapper(nn.Module):
@@ -211,6 +218,11 @@ def _format_block_tag(num_adapter_blocks, prefix):
     return f"{prefix}{num_adapter_blocks}"
 
 
+def _sample_linf_noisy_inputs(inputs, eps):
+    noise = torch.empty_like(inputs).uniform_(-eps, eps)
+    return torch.clamp(inputs + noise, 0.0, 1.0)
+
+
 def build_hira_variant_name(
     classifier_name,
     expansion_dim,
@@ -220,17 +232,26 @@ def build_hira_variant_name(
     max_train_samples,
     seed,
     num_adapter_blocks,
+    adapt_noise_eps=0.0,
+    adapt_noise_num=0,
+    adapt_alpha=1.0,
 ):
     del epochs, lr, weight_decay
 
     sample_tag = "full" if max_train_samples is None or max_train_samples < 0 else str(max_train_samples)
     block_tag = _format_block_tag(num_adapter_blocks, "-blk")
+    noise_tag = (
+        f"-neps{_format_cache_value(adapt_noise_eps)}"
+        f"-nnum{adapt_noise_num}"
+        f"-na{_format_cache_value(adapt_alpha)}"
+    )
     return (
         f"{classifier_name}-hira-v{HIRA_CACHE_VERSION}-post-fc2-closedform-gelu"
         f"{block_tag}"
         f"-exp{expansion_dim}"
         f"-ns{sample_tag}"
         f"-seed{seed}"
+        f"{noise_tag}"
     )
 
 
@@ -243,6 +264,9 @@ def _build_cache_name(
     max_train_samples,
     seed,
     num_adapter_blocks,
+    adapt_noise_eps,
+    adapt_noise_num,
+    adapt_alpha,
 ):
     return build_hira_variant_name(
         classifier_name=classifier_name,
@@ -253,6 +277,9 @@ def _build_cache_name(
         max_train_samples=max_train_samples,
         seed=seed,
         num_adapter_blocks=num_adapter_blocks,
+        adapt_noise_eps=adapt_noise_eps,
+        adapt_noise_num=adapt_noise_num,
+        adapt_alpha=adapt_alpha,
     ).replace("/", "_") + ".pt"
 
 
@@ -311,9 +338,21 @@ def _init_hira_statistics(model, mlp_module_names, stats_device):
             "g_matrix": torch.zeros(rp_dim, rp_dim, dtype=torch.float32, device=stats_device),
             "q_matrix": torch.zeros(rp_dim, out_dim, dtype=torch.float32, device=stats_device),
             "target_norm": torch.zeros((), dtype=torch.float32, device=stats_device),
-            "sample_count": 0,
+            "sample_count": 0.0,
         }
     return statistics
+
+
+def _accumulate_projected_statistics(entry, b_rand, source_tokens, target_tokens, weight):
+    if weight <= 0:
+        return
+
+    projected_inputs = source_tokens.to(dtype=b_rand.dtype)
+    projected = F.gelu(projected_inputs @ b_rand).float()
+    entry["g_matrix"] += weight * (projected.t() @ projected)
+    entry["q_matrix"] += weight * (projected.t() @ target_tokens)
+    entry["target_norm"] += weight * target_tokens.square().sum()
+    entry["sample_count"] += weight * target_tokens.size(0)
 
 
 def _select_ridge_by_regression_loss(
@@ -353,7 +392,17 @@ def _select_ridge_by_regression_loss(
     return best_ridge, best_loss
 
 
-def _accumulate_hira_statistics(model, teacher_model, loader, mlp_module_names, device, description):
+def _accumulate_hira_statistics(
+    model,
+    teacher_model,
+    loader,
+    mlp_module_names,
+    device,
+    description,
+    adapt_noise_eps,
+    adapt_noise_num,
+    adapt_alpha,
+):
     stats_device = device if device.type == "cuda" else torch.device("cpu")
     statistics = _init_hira_statistics(model, mlp_module_names, stats_device)
     b_rand_by_module = {
@@ -365,6 +414,16 @@ def _accumulate_hira_statistics(model, teacher_model, loader, mlp_module_names, 
     }
     batch_cache = {}
     handles = []
+    del adapt_alpha
+    use_noisy_adaptation = adapt_noise_num > 0 and adapt_noise_eps > 0
+    noisy_sample_weight = 1.0 / adapt_noise_num if use_noisy_adaptation else 0.0
+
+    def _run_teacher_forward(batch_inputs):
+        autocast_context = nullcontext()
+        if device.type == "cuda":
+            autocast_context = torch.autocast(device_type="cuda", dtype=torch.float16)
+        with autocast_context:
+            _ = teacher_model(batch_inputs)
 
     for module_name in mlp_module_names:
         teacher_module = _get_module_by_name(teacher_model, module_name)
@@ -379,25 +438,40 @@ def _accumulate_hira_statistics(model, teacher_model, loader, mlp_module_names, 
     try:
         with torch.no_grad():
             for inputs, _ in tqdm(loader, desc=description):
-                batch_cache.clear()
-                autocast_context = nullcontext()
-                if device.type == "cuda":
-                    autocast_context = torch.autocast(device_type="cuda", dtype=torch.float16)
-                with autocast_context:
-                    _ = teacher_model(inputs.to(device, non_blocking=True))
-                for module_name in mlp_module_names:
-                    mlp_outputs = batch_cache[module_name]
-                    token_features = mlp_outputs.reshape(-1, mlp_outputs.shape[-1]).to(stats_device, dtype=torch.float32)
-                    projected_inputs = token_features.to(dtype=b_rand_by_module[module_name].dtype)
-                    projected = F.gelu(projected_inputs @ b_rand_by_module[module_name]).float()
-                    targets = token_features
+                inputs = inputs.to(device, non_blocking=True)
+                if use_noisy_adaptation:
+                    for _ in range(adapt_noise_num):
+                        noisy_inputs = _sample_linf_noisy_inputs(inputs, adapt_noise_eps)
+                        batch_cache.clear()
+                        _run_teacher_forward(noisy_inputs)
 
-                    statistics[module_name]["g_matrix"] += projected.t() @ projected
-                    statistics[module_name]["q_matrix"] += projected.t() @ targets
-                    statistics[module_name]["target_norm"] += targets.square().sum()
-                    statistics[module_name]["sample_count"] += targets.size(0)
-
-                    del token_features, projected_inputs, projected, targets
+                        for module_name in mlp_module_names:
+                            noisy_outputs = batch_cache[module_name].reshape(-1, batch_cache[module_name].shape[-1]).to(
+                                stats_device,
+                                dtype=torch.float32,
+                            )
+                            _accumulate_projected_statistics(
+                                statistics[module_name],
+                                b_rand_by_module[module_name],
+                                noisy_outputs,
+                                noisy_outputs,
+                                weight=noisy_sample_weight,
+                            )
+                else:
+                    batch_cache.clear()
+                    _run_teacher_forward(inputs)
+                    for module_name in mlp_module_names:
+                        clean_outputs = batch_cache[module_name].reshape(-1, batch_cache[module_name].shape[-1]).to(
+                            stats_device,
+                            dtype=torch.float32,
+                        )
+                        _accumulate_projected_statistics(
+                            statistics[module_name],
+                            b_rand_by_module[module_name],
+                            clean_outputs,
+                            clean_outputs,
+                            weight=1.0,
+                        )
     finally:
         for handle in handles:
             handle.remove()
@@ -405,7 +479,17 @@ def _accumulate_hira_statistics(model, teacher_model, loader, mlp_module_names, 
     return statistics
 
 
-def _fit_hira_weights_closed_form(model, teacher_model, train_loader, val_loader, mlp_module_names, device):
+def _fit_hira_weights_closed_form(
+    model,
+    teacher_model,
+    train_loader,
+    val_loader,
+    mlp_module_names,
+    device,
+    adapt_noise_eps,
+    adapt_noise_num,
+    adapt_alpha,
+):
     train_stats = _accumulate_hira_statistics(
         model,
         teacher_model,
@@ -413,6 +497,9 @@ def _fit_hira_weights_closed_form(model, teacher_model, train_loader, val_loader
         mlp_module_names,
         device,
         description="HiRA train stats",
+        adapt_noise_eps=adapt_noise_eps,
+        adapt_noise_num=adapt_noise_num,
+        adapt_alpha=adapt_alpha,
     )
     val_stats = _accumulate_hira_statistics(
         model,
@@ -421,6 +508,9 @@ def _fit_hira_weights_closed_form(model, teacher_model, train_loader, val_loader
         mlp_module_names,
         device,
         description="HiRA val stats",
+        adapt_noise_eps=adapt_noise_eps,
+        adapt_noise_num=adapt_noise_num,
+        adapt_alpha=adapt_alpha,
     )
 
     fit_summary = {}
@@ -479,7 +569,17 @@ def apply_hira_adaptation(
     max_train_samples=-1,
     force_retrain=False,
     train_transform=None,
+    adapt_noise_eps=0.0,
+    adapt_noise_num=0,
+    adapt_alpha=1.0,
 ):
+    if adapt_noise_eps < 0:
+        raise ValueError("HiRA adapt_noise_eps must be non-negative.")
+    if adapt_noise_num < 0:
+        raise ValueError("HiRA adapt_noise_num must be non-negative.")
+    if adapt_alpha < 0:
+        raise ValueError("HiRA adapt_alpha must be non-negative.")
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -502,6 +602,9 @@ def apply_hira_adaptation(
             max_train_samples=max_train_samples,
             seed=seed,
             num_adapter_blocks=num_adapter_blocks,
+            adapt_noise_eps=adapt_noise_eps,
+            adapt_noise_num=adapt_noise_num,
+            adapt_alpha=adapt_alpha,
         ),
     )
 
@@ -526,6 +629,9 @@ def apply_hira_adaptation(
         val_loader,
         mlp_module_names,
         device,
+        adapt_noise_eps=adapt_noise_eps,
+        adapt_noise_num=adapt_noise_num,
+        adapt_alpha=adapt_alpha,
     )
 
     state = {
@@ -535,10 +641,15 @@ def apply_hira_adaptation(
         "max_train_samples": max_train_samples,
         "seed": seed,
         "num_adapter_blocks": num_adapter_blocks,
+        "adapt_noise_eps": adapt_noise_eps,
+        "adapt_noise_num": adapt_noise_num,
+        "adapt_alpha": adapt_alpha,
         "mlp_module_names": mlp_module_names,
         "fit_method": "ridge_regression",
         "ridge_candidates": RIDGE_CANDIDATES,
-        "soft_label_source": "original_mlp_output",
+        "soft_label_source": "noisy_mlp_output" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "original_mlp_output",
+        "noisy_adaptation_target": "noisy_mlp_output" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "original_mlp_output",
+        "adaptation_input_source": "noisy_only" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "clean_only",
         "activation": "gelu",
         "frozen_b": True,
         "ridge_fit_summary": fit_summary,
