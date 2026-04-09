@@ -78,7 +78,7 @@ parameters:
   ranpac_rp_dim:
     values: [10000]
   ranpac_lambda:
-    values: [.1, .2, .25, .5, .75]
+    values: [1]
   ranpac_temp:
     value: 0.10
   ranpac_hardneg_topk:

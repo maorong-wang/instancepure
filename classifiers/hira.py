@@ -22,7 +22,7 @@ from classifiers.ranpac import RIDGE_CANDIDATES
 from dataset import get_dataset
 
 
-HIRA_CACHE_VERSION = 28
+HIRA_CACHE_VERSION = 29
 
 
 class HiRAHalfPrecisionWrapper(nn.Module):
@@ -52,8 +52,8 @@ class HiRAAdapter(nn.Module):
         super().__init__()
         self.register_buffer("b_rand", torch.randn(in_features, expansion_dim, dtype=torch.float16))
         self.a_weight = nn.Parameter(torch.empty(out_features, expansion_dim, dtype=torch.float16))
-        self.register_buffer("soft_threshold_mean", torch.zeros(in_features, dtype=torch.float32))
-        self.register_buffer("soft_threshold_std", torch.ones(in_features, dtype=torch.float32))
+        self.register_buffer("soft_threshold_mean", torch.zeros(expansion_dim, dtype=torch.float32))
+        self.register_buffer("soft_threshold_std", torch.ones(expansion_dim, dtype=torch.float32))
         self.soft_threshold_alpha = float(soft_threshold_alpha)
         self.soft_threshold_beta = float(soft_threshold_beta)
         self.soft_threshold_stat_eps = float(soft_threshold_stat_eps)
@@ -78,25 +78,28 @@ class HiRAAdapter(nn.Module):
 
     def project(self, x):
         token_features = x.reshape(-1, x.shape[-1])
-        token_features = apply_mean_centered_soft_threshold(
-            token_features,
+        if self.force_fp32:
+            token_features = token_features.float()
+            if token_features.device.type == "cuda":
+                self._ensure_fp32_cache(token_features.device)
+                projected = token_features @ self._b_rand_fp32
+            else:
+                projected = token_features @ self.b_rand.float()
+        elif token_features.device.type == "cuda":
+            token_features = token_features.to(dtype=self.b_rand.dtype)
+            projected = token_features @ self.b_rand
+        else:
+            token_features = token_features.float()
+            projected = token_features @ self.b_rand.float()
+        projected = apply_mean_centered_soft_threshold(
+            projected,
             self.soft_threshold_mean,
             self.soft_threshold_std,
             alpha=self.soft_threshold_alpha,
             beta=self.soft_threshold_beta,
             stat_eps=self.soft_threshold_stat_eps,
         )
-        if self.force_fp32:
-            token_features = token_features.float()
-            if token_features.device.type == "cuda":
-                self._ensure_fp32_cache(token_features.device)
-                return F.gelu(token_features @ self._b_rand_fp32)
-            return F.gelu(token_features @ self.b_rand.float())
-        if token_features.device.type == "cuda":
-            token_features = token_features.to(dtype=self.b_rand.dtype)
-            return F.gelu(token_features @ self.b_rand)
-        token_features = token_features.float()
-        return F.gelu(token_features @ self.b_rand.float())
+        return F.relu(projected)
 
     def forward(self, x):
         token_shape = x.shape[:-1]
@@ -311,7 +314,7 @@ def build_hira_variant_name(
         separator="-",
     )
     return (
-        f"{classifier_name}-hira-v{HIRA_CACHE_VERSION}-post-fc2-closedform-gelu"
+        f"{classifier_name}-hira-v{HIRA_CACHE_VERSION}-post-fc2-closedform-relu"
         f"{block_tag}"
         f"-exp{expansion_dim}"
         f"-ns{sample_tag}"
@@ -414,8 +417,8 @@ def _init_hira_statistics(model, mlp_module_names, stats_device, collect_feature
             "sample_count": 0.0,
         }
         if collect_feature_stats:
-            entry["feature_sum"] = torch.zeros(out_dim, dtype=torch.float64, device=stats_device)
-            entry["feature_sum_sq"] = torch.zeros(out_dim, dtype=torch.float64, device=stats_device)
+            entry["feature_sum"] = torch.zeros(rp_dim, dtype=torch.float64, device=stats_device)
+            entry["feature_sum_sq"] = torch.zeros(rp_dim, dtype=torch.float64, device=stats_device)
             entry["feature_sample_count"] = 0
         statistics[module_name] = entry
     return statistics
@@ -433,16 +436,14 @@ def _accumulate_feature_statistics(entry, source_tokens):
 
 def _accumulate_projected_statistics(
     entry,
-    b_rand,
-    source_tokens,
+    projected_tokens,
     target_tokens,
     weight,
 ):
     if weight <= 0:
         return
 
-    projected_inputs = source_tokens.to(dtype=b_rand.dtype)
-    projected = F.gelu(projected_inputs @ b_rand).float()
+    projected = F.relu(projected_tokens)
     entry["g_matrix"] += weight * (projected.t() @ projected)
     entry["q_matrix"] += weight * (projected.t() @ target_tokens)
     entry["target_norm"] += weight * target_tokens.square().sum()
@@ -547,13 +548,15 @@ def _accumulate_hira_statistics(
                             stats_device,
                             dtype=torch.float32,
                         )
+                        clean_projected = (
+                            clean_outputs.to(dtype=b_rand_by_module[module_name].dtype) @ b_rand_by_module[module_name]
+                        ).float()
                         if collect_feature_stats:
-                            _accumulate_feature_statistics(statistics[module_name], clean_outputs)
+                            _accumulate_feature_statistics(statistics[module_name], clean_projected)
                         if not use_noisy_adaptation:
                             _accumulate_projected_statistics(
                                 statistics[module_name],
-                                b_rand_by_module[module_name],
-                                clean_outputs,
+                                clean_projected,
                                 clean_outputs,
                                 weight=1.0,
                             )
@@ -569,13 +572,15 @@ def _accumulate_hira_statistics(
                                 stats_device,
                                 dtype=torch.float32,
                             )
+                            noisy_projected = (
+                                noisy_outputs.to(dtype=b_rand_by_module[module_name].dtype) @ b_rand_by_module[module_name]
+                            ).float()
                             _accumulate_projected_statistics(
                                 statistics[module_name],
-                                b_rand_by_module[module_name],
-                                noisy_outputs,
+                                noisy_projected,
                                 noisy_outputs,
                                 weight=noisy_sample_weight,
-                        )
+                            )
     finally:
         for handle in handles:
             handle.remove()
@@ -799,7 +804,7 @@ def apply_hira_adaptation(
         "soft_label_source": "noisy_mlp_output" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "original_mlp_output",
         "noisy_adaptation_target": "noisy_mlp_output" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "original_mlp_output",
         "adaptation_input_source": "noisy_only" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "clean_only",
-        "activation": "gelu",
+        "activation": "relu",
         "frozen_b": True,
         "ridge_fit_summary": fit_summary,
         "cache_adapter_dtype": "float16",
