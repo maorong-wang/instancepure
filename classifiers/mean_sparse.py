@@ -1,3 +1,5 @@
+import re
+
 import torch
 
 
@@ -26,6 +28,12 @@ def build_meansparse_tag(alpha, beta, stat_eps=DEFAULT_MEANSPARSE_STAT_EPS, sepa
     if float(stat_eps) != DEFAULT_MEANSPARSE_STAT_EPS:
         parts.append(f"mseps{format_cache_value(stat_eps)}")
     return separator + separator.join(parts)
+
+
+def strip_meansparse_tag(text):
+    text = re.sub(r"_msa[^_]+_msb[^_]+(?:_mseps[^_]+)?", "", text)
+    text = re.sub(r"-msa[^-]+-msb[^-]+(?:-mseps[^-]+)?", "", text)
+    return text
 
 
 def apply_mean_centered_soft_threshold(x, mean, std, alpha, beta, stat_eps=DEFAULT_MEANSPARSE_STAT_EPS):

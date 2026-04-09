@@ -22,8 +22,8 @@ Dataset paths default to local folders in `dataset.py` such as `./image_net`; av
 Shared working idea: robustness gains may come from injecting large random projections while preserving the base backbone. Treat RanPAC as the reference head. For HiRA experiments, prefer ViT-family post-MLP attachment on the last `hira_num_blocks` transformer blocks (default `2`): keep the original MLP, then attach `A(GELU(Bx))` after the MLP output with fixed Gaussian `B`. Fit `A` by closed-form ridge regression against the frozen original MLP outputs. Do not switch HiRA `B` or RanPAC `W_rand` to block-orthogonal initialization unless explicitly revisiting that ablation.
 
 Current active code state:
-- `RanPAC` cache version is `11` in `classifiers/ranpac.py`.
-- `HiRA` cache version is `26` in `classifiers/hira.py`.
+- `RanPAC` cache version is `13` in `classifiers/ranpac.py`.
+- `HiRA` cache version is `28` in `classifiers/hira.py`.
 - RanPAC now fits only the `regression` ridge-selection variant; the older validation-accuracy ridge search was removed.
 - RanPAC target construction supports hard negatives: the ridge targets are GT one-hot by default, but when `ranpac_hardneg_topk > 0` and `ranpac_hardneg_gamma > 0`, the top confusing non-GT classes from the teacher logits receive total suppression weight `-ranpac_hardneg_gamma`.
 - Adaptation noise is supported for both RanPAC and HiRA with `adapt_noise_eps`, `adapt_noise_num`, and `adapt_alpha`. The current implementation uses noisy-only adaptation statistics when noise is enabled, rather than mixing clean and noisy stats.

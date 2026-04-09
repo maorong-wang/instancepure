@@ -16,12 +16,13 @@ from classifiers.mean_sparse import (
     build_meansparse_tag,
     format_cache_value,
     is_meansparse_enabled,
+    strip_meansparse_tag,
 )
 from classifiers.ranpac import RIDGE_CANDIDATES
 from dataset import get_dataset
 
 
-HIRA_CACHE_VERSION = 27
+HIRA_CACHE_VERSION = 28
 
 
 class HiRAHalfPrecisionWrapper(nn.Module):
@@ -336,8 +337,9 @@ def _build_cache_name(
     soft_threshold_beta,
     soft_threshold_stat_eps,
 ):
+    del soft_threshold_alpha, soft_threshold_beta, soft_threshold_stat_eps
     return build_hira_variant_name(
-        classifier_name=classifier_name,
+        classifier_name=strip_meansparse_tag(classifier_name),
         expansion_dim=expansion_dim,
         epochs=epochs,
         lr=lr,
@@ -348,9 +350,9 @@ def _build_cache_name(
         adapt_noise_eps=adapt_noise_eps,
         adapt_noise_num=adapt_noise_num,
         adapt_alpha=adapt_alpha,
-        soft_threshold_alpha=soft_threshold_alpha,
-        soft_threshold_beta=soft_threshold_beta,
-        soft_threshold_stat_eps=soft_threshold_stat_eps,
+        soft_threshold_alpha=0.0,
+        soft_threshold_beta=8.0,
+        soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
     ).replace("/", "_") + ".pt"
 
 
@@ -615,7 +617,7 @@ def _fit_hira_weights_closed_form(
         adapt_noise_eps=adapt_noise_eps,
         adapt_noise_num=adapt_noise_num,
         adapt_alpha=adapt_alpha,
-        collect_feature_stats=is_meansparse_enabled(soft_threshold_alpha),
+        collect_feature_stats=True,
     )
     val_stats = _accumulate_hira_statistics(
         model,
@@ -636,16 +638,9 @@ def _fit_hira_weights_closed_form(
         val_entry = val_stats[module_name]
         out_features = wrapper.mlp_adapter.a_weight.size(0)
 
-        if is_meansparse_enabled(soft_threshold_alpha):
-            soft_threshold_mean = train_entry["soft_threshold_mean"]
-            soft_threshold_std = train_entry["soft_threshold_std"]
-        else:
-            soft_threshold_mean = torch.zeros(out_features, dtype=torch.float32)
-            soft_threshold_std = torch.ones(out_features, dtype=torch.float32)
-
         with torch.no_grad():
-            wrapper.mlp_adapter.soft_threshold_mean.copy_(soft_threshold_mean)
-            wrapper.mlp_adapter.soft_threshold_std.copy_(soft_threshold_std)
+            wrapper.mlp_adapter.soft_threshold_mean.copy_(train_entry["soft_threshold_mean"])
+            wrapper.mlp_adapter.soft_threshold_std.copy_(train_entry["soft_threshold_std"])
 
         ridge, regression_loss = _select_ridge_by_regression_loss(
             train_entry["g_matrix"],

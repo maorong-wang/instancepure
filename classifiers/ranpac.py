@@ -12,13 +12,13 @@ from torch.utils.data import DataLoader, Subset
 from classifiers.mean_sparse import (
     DEFAULT_MEANSPARSE_STAT_EPS,
     apply_mean_centered_soft_threshold,
-    build_meansparse_tag,
     format_cache_value,
     is_meansparse_enabled,
+    strip_meansparse_tag,
 )
 
 RIDGE_CANDIDATES = [10.0 ** power for power in range(-8, 14)]
-RANPAC_CACHE_VERSION = 12
+RANPAC_CACHE_VERSION = 13
 
 
 class RanPACLinear(nn.Module):
@@ -473,25 +473,19 @@ def _fit_ranpac_state(
         out_features,
         device,
         description=(
-            "RanPAC train baseline, ridge, and soft-threshold stats"
-            if is_meansparse_enabled(soft_threshold_alpha)
-            else "RanPAC train baseline and ridge stats"
+            "RanPAC train baseline, ridge, and feature stats"
         ),
         adapt_noise_eps=adapt_noise_eps,
         adapt_noise_num=adapt_noise_num,
         adapt_alpha=adapt_alpha,
         hardneg_topk=hardneg_topk,
         hardneg_gamma=hardneg_gamma,
-        collect_feature_stats=is_meansparse_enabled(soft_threshold_alpha),
+        collect_feature_stats=True,
         accumulate_ridge_stats=True,
     )
     baseline_logit_mean = train_stats["baseline_logit_mean"]
-    if is_meansparse_enabled(soft_threshold_alpha):
-        soft_threshold_mean = train_stats["feature_mean"]
-        soft_threshold_std = train_stats["feature_std"]
-    else:
-        soft_threshold_mean = torch.zeros(in_features, dtype=torch.float32)
-        soft_threshold_std = torch.ones(in_features, dtype=torch.float32)
+    soft_threshold_mean = train_stats["feature_mean"]
+    soft_threshold_std = train_stats["feature_std"]
     g_train = train_stats["g_matrix"]
     q_train = train_stats["q_matrix"]
     if val_loader is not None:
@@ -557,6 +551,7 @@ def _fit_ranpac_state(
         "soft_threshold_mean_source": "train_clean_feature_channel",
         "soft_threshold_mean": soft_threshold_mean,
         "soft_threshold_std": soft_threshold_std,
+        "soft_threshold_stats_collected": True,
         "soft_threshold_alpha": soft_threshold_alpha,
         "soft_threshold_beta": soft_threshold_beta,
         "soft_threshold_stat_eps": soft_threshold_stat_eps,
@@ -636,45 +631,23 @@ def apply_ranpac_head(
         f"_htk{hardneg_topk}"
         f"_hg{format_cache_value(hardneg_gamma)}"
     )
-    meansparse_tag = build_meansparse_tag(
-        alpha=soft_threshold_alpha,
-        beta=soft_threshold_beta,
-        stat_eps=soft_threshold_stat_eps,
-        separator="_",
+    cache_classifier_name = strip_meansparse_tag(classifier_name)
+    cache_base = (
+        f"{cache_classifier_name.replace('/', '_')}_rp{rp_dim}_seed{seed}"
+        f"{noise_tag}{hardneg_tag}"
     )
     cache_name = (
-        f"{classifier_name.replace('/', '_')}_rp{rp_dim}_seed{seed}"
-        f"{noise_tag}{hardneg_tag}{meansparse_tag}_ranpac_v{RANPAC_CACHE_VERSION}.pt"
+        f"{cache_base}_ranpac_v{RANPAC_CACHE_VERSION}.pt"
     )
     cache_path = os.path.join(cache_dir, cache_name)
 
     layer_name, linear_layer = _find_last_linear(model)
     if os.path.exists(cache_path):
         state = torch.load(cache_path, map_location="cpu")
-        if state.get("version") != RANPAC_CACHE_VERSION or "weight" not in state:
-            state = _fit_ranpac_state(
-                model,
-                classifier_name=classifier_name,
-                dataset_root=dataset_root,
-                cache_path=cache_path,
-                rp_dim=rp_dim,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                seed=seed,
-                device=device,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                train_transform=train_transform,
-                adapt_noise_eps=adapt_noise_eps,
-                adapt_noise_num=adapt_noise_num,
-                adapt_alpha=adapt_alpha,
-                hardneg_topk=hardneg_topk,
-                hardneg_gamma=hardneg_gamma,
-                soft_threshold_alpha=soft_threshold_alpha,
-                soft_threshold_beta=soft_threshold_beta,
-                soft_threshold_stat_eps=soft_threshold_stat_eps,
-            )
     else:
+        state = None
+
+    if state is None or state.get("version") != RANPAC_CACHE_VERSION or "weight" not in state:
         state = _fit_ranpac_state(
             model,
             classifier_name=classifier_name,
@@ -711,9 +684,9 @@ def apply_ranpac_head(
         w_rand=state["w_rand"],
         soft_threshold_mean=state["soft_threshold_mean"],
         soft_threshold_std=state["soft_threshold_std"],
-        soft_threshold_alpha=state["soft_threshold_alpha"],
-        soft_threshold_beta=state["soft_threshold_beta"],
-        soft_threshold_stat_eps=state.get("soft_threshold_stat_eps", DEFAULT_MEANSPARSE_STAT_EPS),
+        soft_threshold_alpha=soft_threshold_alpha,
+        soft_threshold_beta=soft_threshold_beta,
+        soft_threshold_stat_eps=soft_threshold_stat_eps,
     )
     ranpac_head = ResidualRanPACLinear(
         original_linear=linear_layer,
