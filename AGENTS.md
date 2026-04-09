@@ -21,14 +21,43 @@ Dataset paths default to local folders in `dataset.py` such as `./image_net`; av
 ## Current Research Notes
 Shared working idea: robustness gains may come from injecting large random projections while preserving the base backbone. Treat RanPAC as the reference head. For HiRA experiments, prefer ViT-family post-MLP attachment on the last `hira_num_blocks` transformer blocks (default `2`): keep the original MLP, then attach `A(GELU(Bx))` after the MLP output with fixed Gaussian `B`. Fit `A` by closed-form ridge regression against the frozen original MLP outputs. Do not switch HiRA `B` or RanPAC `W_rand` to block-orthogonal initialization unless explicitly revisiting that ablation.
 
+Current active code state:
+- `RanPAC` cache version is `11` in `classifiers/ranpac.py`.
+- `HiRA` cache version is `26` in `classifiers/hira.py`.
+- RanPAC now fits only the `regression` ridge-selection variant; the older validation-accuracy ridge search was removed.
+- RanPAC target construction supports hard negatives: the ridge targets are GT one-hot by default, but when `ranpac_hardneg_topk > 0` and `ranpac_hardneg_gamma > 0`, the top confusing non-GT classes from the teacher logits receive total suppression weight `-ranpac_hardneg_gamma`.
+- Adaptation noise is supported for both RanPAC and HiRA with `adapt_noise_eps`, `adapt_noise_num`, and `adapt_alpha`. The current implementation uses noisy-only adaptation statistics when noise is enabled, rather than mixing clean and noisy stats.
+- Current RanPAC inference formula is:
+  `logit = (1 - ranpac_lambda) * (logit_baseline - mean_train_logits) + ranpac_lambda * (logit_ranpac / ranpac_temp)`.
+- `mean_train_logits` is currently a single global scalar mean over all baseline logits on the clean RanPAC train split, not a per-class vector.
+- The baseline-logit scalar bias is cached inside the RanPAC state as `baseline_logit_mean`; changing this behavior requires a cache-version bump.
+- Important mismatch to remember: the `RanPAC` code currently allows `ranpac_lambda >= 0`, but the CLI help text in `test.py` and `eval_robustbench_ranpac.py` still describes it as a convex mixing weight. Check `classifiers/ranpac.py` before assuming `ranpac_lambda <= 1`.
+- Current InstantPure and RobustBench result naming adds a `bbias` suffix for RanPAC variants because the baseline-logit scalar bias subtraction changed the effective head behavior.
+- HiRA currently uses half precision during fitting on CUDA via `HiRAHalfPrecisionWrapper` / autocast, but evaluation is forced back to fp32 by `_prepare_hira_model_for_eval`.
+
 ## New Thread Handoff
 This project is an ImageNet adversarial-defense codebase centered on `InstantPure`, a purification-based method that denoises inputs with a diffusion pipeline before classification. The repo now also evaluates adversarially trained models from RobustBench under the same RanPAC and HiRA ideas.
 
-Our main method is to modify the victim classifier rather than the purifier. `RanPAC` replaces the final linear layer with a random-projection ridge head from [classifiers/ranpac.py](/home_fmg/maorong/python/InstantPure/classifiers/ranpac.py): features are projected by fixed Gaussian `W_rand`, passed through `GELU`, then fit by ridge regression; both `regression` and `val_acc` ridge-selection variants are cached. `HiRA` lives in [classifiers/hira.py](/home_fmg/maorong/python/InstantPure/classifiers/hira.py): for ViT-family backbones only, keep the original MLP and attach `A(GELU(Bx))` after the MLP output in the last `hira_num_blocks` transformer blocks. `B` is fixed Gaussian, and each `A` is solved by closed-form ridge regression to match the original frozen MLP outputs. Current preference is Gaussian initialization; do not use block-orthogonal init.
+Our main method is to modify the victim classifier rather than the purifier. `RanPAC` replaces the final linear layer with a random-projection ridge head from [classifiers/ranpac.py](/home_fmg/maorong/python/InstantPure/classifiers/ranpac.py): features are projected by fixed Gaussian `W_rand`, passed through `GELU`, then fit by ridge regression. The cached state now includes the RP weights, the chosen ridge, the hard-negative target settings, the noise-adaptation settings, and a scalar clean-train baseline-logit mean used at inference time. `HiRA` lives in [classifiers/hira.py](/home_fmg/maorong/python/InstantPure/classifiers/hira.py): for ViT-family backbones only, keep the original MLP and attach `A(GELU(Bx))` after the MLP output in the last `hira_num_blocks` transformer blocks. `B` is fixed Gaussian, and each `A` is solved by closed-form ridge regression to match the original frozen MLP outputs. Current preference is Gaussian initialization; do not use block-orthogonal init.
 
-Purification-based evaluation is in [test.py](/home_fmg/maorong/python/InstantPure/test.py). It loads a victim classifier through [archs.py](/home_fmg/maorong/python/InstantPure/archs.py), optionally applies HiRA and/or RanPAC, samples a random ImageNet `test` subset, attacks the classifier directly, and reports both baseline and purified metrics. Key outputs are raw classifier clean accuracy (`classifier_accuracy`), raw classifier robust accuracy under the attack (`original_classifier_robust_accuracy`), purified clean accuracy, and purified robust accuracy after the diffusion denoiser. Attacks include Foolbox PGD, AutoAttack, and `stadv` imported from `../DiffPure`. `advertorch` is not used.
+Purification-based evaluation is in [test.py](/home_fmg/maorong/python/InstantPure/test.py). It loads a victim classifier through [archs.py](/home_fmg/maorong/python/InstantPure/archs.py), optionally applies HiRA and/or RanPAC, samples a random ImageNet `test` subset, attacks the classifier directly, and reports both baseline and purified metrics. Key outputs are raw classifier clean accuracy (`classifier_accuracy`), raw classifier robust accuracy under the attack (`original_classifier_robust_accuracy`), purified clean accuracy, and purified robust accuracy after the diffusion denoiser. Attacks include Foolbox PGD, AutoAttack, and `stadv` imported from `../DiffPure`. `advertorch` is not used. The InstantPure CLI currently exposes `ranpac_lambda`, `ranpac_temp`, `ranpac_hardneg_topk`, and `ranpac_hardneg_gamma`, and RanPAC variants are tagged with `_bbias` in output paths.
 
-Adversarial-training evaluation is in [eval_robustbench_ranpac.py](/home_fmg/maorong/python/InstantPure/eval_robustbench_ranpac.py). It loads RobustBench models, evaluates `original`, `hira`, `ranpac_regression`, `ranpac_val_acc`, and combined variants, on a random sampled eval set with clean accuracy plus PGD and/or AutoAttack robust accuracy. W&B logging and sweeps are already wired in `sweeps/robustbench_ranpac_imagenet.yaml`.
+Adversarial-training evaluation is in [eval_robustbench_ranpac.py](/home_fmg/maorong/python/InstantPure/eval_robustbench_ranpac.py). It loads RobustBench models, evaluates `original`, `hira`, `ranpac_regression`, and combined variants, on a random sampled eval set with clean accuracy plus PGD and/or AutoAttack robust accuracy. RobustBench preprocessing is taken from `robustbench.data.get_preprocessing(...)` and passed into the official `benchmark(...)` call for `autoattack_version=standard`. Local AutoAttack variants are also supported:
+- `standard`: official RobustBench `benchmark(...)` with `to_disk=True`
+- `full`: local AutoAttack with `apgd-ce`, `apgd-dlr`, `fab`, `square`
+- `rand`: local AutoAttack with `apgd-ce`, `apgd-dlr`, one restart, configurable `autoattack_eot_iter`
+- `apgdt`: local AutoAttack with `apgd-t`, `n_restarts=1`, `n_target_classes=9` for `Linf`/`L2`
+
+The RobustBench evaluation code also computes RanPAC diagnostics from clean logits:
+- reference-target margin changes for the baseline top confusing classes
+- top-1 confusing-class preservation
+- top-k overlap / ordered match / rank-shift statistics
+
+Current sweep and cache assumptions:
+- Existing RanPAC caches before version `11` are stale for the current baseline-bias-corrected head and should be retrained.
+- Existing RobustBench benchmark result files can collide when the `benchmark_model_name` is reused, so the current code appends `-bbias` to RanPAC variant names to avoid mixing old and new on-disk AutoAttack outputs.
+- The default RobustBench sweep currently targets ImageNet, `autoattack_version=standard`, and includes `ranpac_temp`.
+- The current `sweeps/robustbench_ranpac_imagenet.yaml` project name still reflects an older experiment label (`robustbench-ranpac-hira-rc-rp_normalization`) and is not guaranteed to match the current head behavior; update it explicitly if that label matters for a fresh sweep.
 
 ## Suggested First Prompt
 Open `AGENTS.md`, `classifiers/hira.py`, `classifiers/ranpac.py`, `test.py`, and `eval_robustbench_ranpac.py`, then summarize the current InstantPure and RobustBench evaluation flows, the active RanPAC/HiRA design choices, and any cache/version assumptions before making changes.

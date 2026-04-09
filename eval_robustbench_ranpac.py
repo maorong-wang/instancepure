@@ -189,7 +189,28 @@ def parse_args():
         "--ranpac_lambda",
         type=float,
         default=1.0,
-        help="Residual weight for the RanPAC branch added on top of the original classifier head.",
+        help="Convex mixing weight between the original classifier head and the temperature-scaled RanPAC head.",
+    )
+    parser.add_argument(
+        "--ranpac-temp",
+        "--ranpac_temp",
+        type=float,
+        default=1.0,
+        help="Temperature applied to the RanPAC logits before ensembling.",
+    )
+    parser.add_argument(
+        "--ranpac-hardneg-topk",
+        "--ranpac_hardneg_topk",
+        type=int,
+        default=9,
+        help="Number of top confusing non-ground-truth classes to suppress in the RanPAC regression targets.",
+    )
+    parser.add_argument(
+        "--ranpac-hardneg-gamma",
+        "--ranpac_hardneg_gamma",
+        type=float,
+        default=1.0,
+        help="Total suppression weight assigned across the RanPAC hard-negative classes.",
     )
     parser.add_argument("--ranpac-cache-dir", "--ranpac_cache_dir", default="pretrained/ranpac_robustbench", help="RanPAC cache directory.")
     parser.add_argument(
@@ -810,11 +831,25 @@ def main():
                         adapt_noise_num=args.adapt_noise_num,
                         adapt_alpha=args.adapt_alpha,
                         ranpac_lambda=args.ranpac_lambda,
+                        ranpac_temp=args.ranpac_temp,
+                        hardneg_topk=args.ranpac_hardneg_topk,
+                        hardneg_gamma=args.ranpac_hardneg_gamma,
                     ).to(device).eval()
                 model = freeze_backbone(model).to(device).eval()
                 benchmark_model_name = f"{model_name}-{variant_cfg['variant']}"
+                if variant_cfg["use_ranpac"]:
+                    benchmark_model_name = f"{benchmark_model_name}-bbias"
                 if variant_cfg["use_ranpac"] and args.ranpac_lambda != 1.0:
                     benchmark_model_name = f"{benchmark_model_name}-lam{str(args.ranpac_lambda).replace('/', '_')}"
+                if variant_cfg["use_ranpac"] and args.ranpac_temp != 1.0:
+                    benchmark_model_name = f"{benchmark_model_name}-temp{str(args.ranpac_temp).replace('/', '_')}"
+                if variant_cfg["use_ranpac"] and (
+                    args.ranpac_hardneg_topk != 9 or args.ranpac_hardneg_gamma != 1.0
+                ):
+                    benchmark_model_name = (
+                        f"{benchmark_model_name}-htk{args.ranpac_hardneg_topk}"
+                        f"-hg{str(args.ranpac_hardneg_gamma).replace('/', '_')}"
+                    )
 
                 metrics = evaluate_variant(
                     model,
@@ -858,6 +893,10 @@ def main():
                         "use_ranpac": variant_cfg["use_ranpac"],
                         "ranpac_selection_method": variant_cfg["ranpac_selection_method"],
                         "ranpac_lambda": args.ranpac_lambda,
+                        "ranpac_temp": args.ranpac_temp,
+                        "ranpac_baseline_bias_centered": variant_cfg["use_ranpac"],
+                        "ranpac_hardneg_topk": args.ranpac_hardneg_topk,
+                        "ranpac_hardneg_gamma": args.ranpac_hardneg_gamma,
                         "adapt_noise_eps": args.adapt_noise_eps,
                         "adapt_noise_num": args.adapt_noise_num,
                         "adapt_alpha": args.adapt_alpha,

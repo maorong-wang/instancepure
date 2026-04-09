@@ -10,7 +10,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
 
 RIDGE_CANDIDATES = [10.0 ** power for power in range(-8, 14)]
-RANPAC_CACHE_VERSION = 8
+RANPAC_CACHE_VERSION = 11
 
 
 def _format_cache_value(value):
@@ -36,14 +36,19 @@ class RanPACLinear(nn.Module):
 
 
 class ResidualRanPACLinear(nn.Module):
-    def __init__(self, original_linear, ranpac_linear, ranpac_lambda):
+    def __init__(self, original_linear, ranpac_linear, ranpac_lambda, ranpac_temp, baseline_logit_mean):
         super().__init__()
         self.original_linear = original_linear
         self.ranpac_linear = ranpac_linear
         self.ranpac_lambda = float(ranpac_lambda)
+        self.ranpac_temp = float(ranpac_temp)
+        self.register_buffer("baseline_logit_mean", baseline_logit_mean.reshape(()))
 
     def forward(self, x):
-        return self.original_linear(x) + self.ranpac_lambda * self.ranpac_linear(x)
+        baseline_logits = self.original_linear(x)
+        baseline_logits = baseline_logits - self.baseline_logit_mean.to(dtype=baseline_logits.dtype)
+        ranpac_logits = self.ranpac_linear(x) / self.ranpac_temp
+        return (1 - self.ranpac_lambda) * baseline_logits + self.ranpac_lambda * ranpac_logits
 
 
 def _get_module_by_name(model, module_name):
@@ -148,6 +153,23 @@ def _sample_linf_noisy_inputs(inputs, eps):
     return torch.clamp(inputs + noise, 0.0, 1.0)
 
 
+def _build_supervised_targets(logits, labels, out_features, hardneg_topk, hardneg_gamma):
+    targets = F.one_hot(labels.cpu(), num_classes=out_features).float()
+    if hardneg_topk <= 0 or hardneg_gamma <= 0:
+        return targets
+
+    topk = min(int(hardneg_topk), out_features - 1)
+    if topk <= 0:
+        return targets
+
+    logits_cpu = logits.detach().float().cpu()
+    logits_cpu[torch.arange(logits_cpu.size(0)), labels.cpu()] = float("-inf")
+    confusing_classes = logits_cpu.topk(topk, dim=1).indices
+    suppress_values = targets.new_full(confusing_classes.shape, -float(hardneg_gamma) / float(topk))
+    targets.scatter_add_(1, confusing_classes, suppress_values)
+    return targets
+
+
 def _accumulate_statistics(
     model,
     linear_layer,
@@ -159,6 +181,8 @@ def _accumulate_statistics(
     adapt_noise_eps,
     adapt_noise_num,
     adapt_alpha,
+    hardneg_topk,
+    hardneg_gamma,
 ):
     feature_buffer = []
 
@@ -179,31 +203,44 @@ def _accumulate_statistics(
             for inputs, targets in tqdm(loader, desc=description):
                 inputs = inputs.to(device)
                 targets = targets.to(device)
-                onehot = F.one_hot(targets.cpu(), num_classes=out_features).float()
-                target_norm_value = onehot.square().sum().item()
-
                 if use_noisy_adaptation:
                     for _ in range(adapt_noise_num):
                         noisy_inputs = _sample_linf_noisy_inputs(inputs, adapt_noise_eps)
                         feature_buffer.clear()
-                        _ = model(noisy_inputs)
+                        noisy_logits = model(noisy_inputs)
                         noisy_features = feature_buffer.pop().view(inputs.size(0), -1).cpu()
                         noisy_projected = F.gelu(noisy_features @ w_rand)
+                        noisy_targets = _build_supervised_targets(
+                            noisy_logits,
+                            targets,
+                            out_features,
+                            hardneg_topk=hardneg_topk,
+                            hardneg_gamma=hardneg_gamma,
+                        )
+                        target_norm_value = noisy_targets.square().sum().item()
 
                         g_matrix += noisy_sample_weight * (noisy_projected.t() @ noisy_projected)
-                        q_matrix += noisy_sample_weight * (noisy_projected.t() @ onehot)
+                        q_matrix += noisy_sample_weight * (noisy_projected.t() @ noisy_targets)
                         target_norm += noisy_sample_weight * target_norm_value
-                        sample_count += noisy_sample_weight * onehot.size(0)
+                        sample_count += noisy_sample_weight * noisy_targets.size(0)
                 else:
                     feature_buffer.clear()
-                    _ = model(inputs)
+                    logits = model(inputs)
                     features = feature_buffer.pop().view(inputs.size(0), -1).cpu()
                     projected = F.gelu(features @ w_rand)
+                    supervised_targets = _build_supervised_targets(
+                        logits,
+                        targets,
+                        out_features,
+                        hardneg_topk=hardneg_topk,
+                        hardneg_gamma=hardneg_gamma,
+                    )
+                    target_norm_value = supervised_targets.square().sum().item()
 
                     g_matrix += projected.t() @ projected
-                    q_matrix += projected.t() @ onehot
+                    q_matrix += projected.t() @ supervised_targets
                     target_norm += target_norm_value
-                    sample_count += onehot.size(0)
+                    sample_count += supervised_targets.size(0)
     finally:
         handle.remove()
 
@@ -238,6 +275,23 @@ def _select_ridge_by_regression_loss(g_train, q_train, g_val, q_val, val_target_
     return best_ridge, best_loss
 
 
+def _estimate_baseline_logit_mean(model, loader, device, description):
+    logit_sum = 0.0
+    logit_count = 0
+
+    model = model.eval()
+    with torch.no_grad():
+        for inputs, _ in tqdm(loader, desc=description):
+            inputs = inputs.to(device)
+            logits = model(inputs).float().cpu()
+            logit_sum += logits.sum().item()
+            logit_count += logits.numel()
+
+    if logit_count == 0:
+        raise ValueError("RanPAC baseline-logit-mean estimation loader is empty.")
+    return torch.tensor(logit_sum / float(logit_count), dtype=torch.float32)
+
+
 def _fit_ranpac_state(
     model,
     classifier_name,
@@ -254,6 +308,8 @@ def _fit_ranpac_state(
     adapt_noise_eps=0.0,
     adapt_noise_num=0,
     adapt_alpha=1.0,
+    hardneg_topk=9,
+    hardneg_gamma=1.0,
 ):
     layer_name, linear_layer = _find_last_linear(model)
     in_features = linear_layer.in_features
@@ -274,6 +330,12 @@ def _fit_ranpac_state(
 
     model = model.eval().to(device)
     print(f"Fitting RanPAC head for {cache_path}...")
+    baseline_logit_mean = _estimate_baseline_logit_mean(
+        model,
+        train_loader,
+        device,
+        description="RanPAC baseline bias",
+    )
     g_train, q_train, _, _ = _accumulate_statistics(
         model,
         linear_layer,
@@ -285,6 +347,8 @@ def _fit_ranpac_state(
         adapt_noise_eps=adapt_noise_eps,
         adapt_noise_num=adapt_noise_num,
         adapt_alpha=adapt_alpha,
+        hardneg_topk=hardneg_topk,
+        hardneg_gamma=hardneg_gamma,
     )
     if val_loader is not None:
         g_val, q_val, val_target_norm, val_sample_count = _accumulate_statistics(
@@ -298,6 +362,8 @@ def _fit_ranpac_state(
             adapt_noise_eps=adapt_noise_eps,
             adapt_noise_num=adapt_noise_num,
             adapt_alpha=adapt_alpha,
+            hardneg_topk=hardneg_topk,
+            hardneg_gamma=hardneg_gamma,
         )
     else:
         g_val = torch.zeros_like(g_train)
@@ -334,11 +400,15 @@ def _fit_ranpac_state(
         "split_seed": seed,
         "ridge_candidates": RIDGE_CANDIDATES,
         "selection_method": "regression",
-        "target_type": "ground_truth",
+        "target_type": "hard_negative_supervised" if hardneg_topk > 0 and hardneg_gamma > 0 else "ground_truth",
         "adaptation_input_source": "noisy_only" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "clean_only",
         "adapt_noise_eps": adapt_noise_eps,
         "adapt_noise_num": adapt_noise_num,
         "adapt_alpha": adapt_alpha,
+        "hardneg_topk": hardneg_topk,
+        "hardneg_gamma": hardneg_gamma,
+        "baseline_logit_mean_source": "train_clean_global_scalar",
+        "baseline_logit_mean": baseline_logit_mean,
         "ridge": regression_ridge,
         "weight": weight,
         "w_rand": w_rand,
@@ -369,6 +439,9 @@ def apply_ranpac_head(
     adapt_noise_num=0,
     adapt_alpha=1.0,
     ranpac_lambda=1.0,
+    ranpac_temp=1.0,
+    hardneg_topk=9,
+    hardneg_gamma=1.0,
 ):
     if train_loader is None and "imagenet" not in classifier_name:
         raise NotImplementedError("RanPAC head replacement is currently implemented for ImageNet classifiers only.")
@@ -381,7 +454,13 @@ def apply_ranpac_head(
     if adapt_alpha < 0:
         raise ValueError("RanPAC adapt_alpha must be non-negative.")
     if ranpac_lambda < 0:
-        raise ValueError("RanPAC ranpac_lambda must be non-negative.")
+        raise ValueError("RanPAC ranpac_lambda must be in [0, inf).")
+    if ranpac_temp <= 0:
+        raise ValueError("RanPAC ranpac_temp must be positive.")
+    if hardneg_topk < 0:
+        raise ValueError("RanPAC hardneg_topk must be non-negative.")
+    if hardneg_gamma < 0:
+        raise ValueError("RanPAC hardneg_gamma must be non-negative.")
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -393,9 +472,13 @@ def apply_ranpac_head(
         f"_nnum{adapt_noise_num}"
         f"_na{_format_cache_value(adapt_alpha)}"
     )
+    hardneg_tag = (
+        f"_htk{hardneg_topk}"
+        f"_hg{_format_cache_value(hardneg_gamma)}"
+    )
     cache_name = (
         f"{classifier_name.replace('/', '_')}_rp{rp_dim}_seed{seed}"
-        f"{noise_tag}_ranpac_v{RANPAC_CACHE_VERSION}.pt"
+        f"{noise_tag}{hardneg_tag}_ranpac_v{RANPAC_CACHE_VERSION}.pt"
     )
     cache_path = os.path.join(cache_dir, cache_name)
 
@@ -419,6 +502,8 @@ def apply_ranpac_head(
                 adapt_noise_eps=adapt_noise_eps,
                 adapt_noise_num=adapt_noise_num,
                 adapt_alpha=adapt_alpha,
+                hardneg_topk=hardneg_topk,
+                hardneg_gamma=hardneg_gamma,
             )
     else:
         state = _fit_ranpac_state(
@@ -437,6 +522,8 @@ def apply_ranpac_head(
             adapt_noise_eps=adapt_noise_eps,
             adapt_noise_num=adapt_noise_num,
             adapt_alpha=adapt_alpha,
+            hardneg_topk=hardneg_topk,
+            hardneg_gamma=hardneg_gamma,
         )
 
     if state["layer_name"] != layer_name:
@@ -455,6 +542,8 @@ def apply_ranpac_head(
         original_linear=linear_layer,
         ranpac_linear=ranpac_branch,
         ranpac_lambda=ranpac_lambda,
+        ranpac_temp=ranpac_temp,
+        baseline_logit_mean=state["baseline_logit_mean"],
     )
     _set_module_by_name(model, layer_name, ranpac_head)
     return model

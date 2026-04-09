@@ -82,7 +82,10 @@ def parse_args():
     parser.add_argument("--ranpac_batch_size", type=int, default=256, help="batch size used to fit the RanPAC head")
     parser.add_argument("--ranpac_num_workers", type=int, default=8, help="number of workers used to fit the RanPAC head")
     parser.add_argument("--ranpac_seed", type=int, default=0, help="seed used to build the RanPAC random projection")
-    parser.add_argument("--ranpac_lambda", type=float, default=1.0, help="residual weight for the RanPAC branch added on top of the original classifier head")
+    parser.add_argument("--ranpac_lambda", type=float, default=1.0, help="convex mixing weight between the original classifier head and the temperature-scaled RanPAC head")
+    parser.add_argument("--ranpac_temp", type=float, default=1.0, help="temperature applied to the RanPAC logits before ensembling")
+    parser.add_argument("--ranpac_hardneg_topk", type=int, default=9, help="number of top confusing non-ground-truth classes to suppress in the RanPAC regression targets")
+    parser.add_argument("--ranpac_hardneg_gamma", type=float, default=1.0, help="total suppression weight assigned across the RanPAC hard-negative classes")
     parser.add_argument(
         "--ranpac_selection_method",
         type=str,
@@ -408,9 +411,16 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         if args.hira_num_blocks != 2:
             classifier_variant = f"{classifier_variant}_blk{args.hira_num_blocks}"
     if args.use_ranpac_head:
-        classifier_variant = f"{classifier_variant}_ranpac_{args.ranpac_selection_method}"
+        classifier_variant = f"{classifier_variant}_ranpac_{args.ranpac_selection_method}_bbias"
         if args.ranpac_lambda != 1.0:
             classifier_variant = f"{classifier_variant}_lam{_format_variant_noise_value(args.ranpac_lambda)}"
+        if args.ranpac_temp != 1.0:
+            classifier_variant = f"{classifier_variant}_temp{_format_variant_noise_value(args.ranpac_temp)}"
+        if args.ranpac_hardneg_topk != 9 or args.ranpac_hardneg_gamma != 1.0:
+            classifier_variant = (
+                f"{classifier_variant}_htk{args.ranpac_hardneg_topk}"
+                f"_hg{_format_variant_noise_value(args.ranpac_hardneg_gamma)}"
+            )
     if adapt_noise_tag and (args.use_hira_adapter or args.use_ranpac_head):
         classifier_variant = f"{classifier_variant}{adapt_noise_tag}"
     lora_dir = args.lora_input_dir or "no_lora"
@@ -455,6 +465,9 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         ranpac_seed=args.ranpac_seed,
         ranpac_selection_method=args.ranpac_selection_method,
         ranpac_lambda=args.ranpac_lambda,
+        ranpac_temp=args.ranpac_temp,
+        ranpac_hardneg_topk=args.ranpac_hardneg_topk,
+        ranpac_hardneg_gamma=args.ranpac_hardneg_gamma,
         ranpac_cache_dir=args.ranpac_cache_dir,
         ranpac_dataset_root=args.ranpac_dataset_root,
         device=device,
@@ -581,6 +594,10 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         "adapt_noise_num": args.adapt_noise_num,
         "adapt_alpha": args.adapt_alpha,
         "ranpac_lambda": args.ranpac_lambda,
+        "ranpac_temp": args.ranpac_temp,
+        "ranpac_baseline_bias_centered": args.use_ranpac_head,
+        "ranpac_hardneg_topk": args.ranpac_hardneg_topk,
+        "ranpac_hardneg_gamma": args.ranpac_hardneg_gamma,
     }
 
     stat = pd.DataFrame(metrics, index=[0])

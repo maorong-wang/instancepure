@@ -60,6 +60,12 @@ parameters:
     value: 8192
   ranpac_lambda:
     value: 1.0
+  ranpac_temp:
+    value: 1.0
+  ranpac_hardneg_topk:
+    value: 9
+  ranpac_hardneg_gamma:
+    value: 1.0
   ranpac_batch_size:
     value: 256
   ranpac_num_workers:

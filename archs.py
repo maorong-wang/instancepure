@@ -169,6 +169,9 @@ def get_archs(
     ranpac_seed=0,
     ranpac_selection_method="regression",
     ranpac_lambda=1.0,
+    ranpac_temp=1.0,
+    ranpac_hardneg_topk=9,
+    ranpac_hardneg_gamma=1.0,
     ranpac_cache_dir="pretrained/ranpac",
     ranpac_dataset_root=None,
     device=None,
@@ -234,6 +237,9 @@ def get_archs(
             adapt_noise_num=adapt_noise_num,
             adapt_alpha=adapt_alpha,
             ranpac_lambda=ranpac_lambda,
+            ranpac_temp=ranpac_temp,
+            hardneg_topk=ranpac_hardneg_topk,
+            hardneg_gamma=ranpac_hardneg_gamma,
         )
 
     return classifier
