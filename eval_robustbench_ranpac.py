@@ -77,6 +77,25 @@ def str2bool(v):
     raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
+def _format_variant_value(value):
+    text = str(value)
+    for old, new in (("/", "_"), (" ", ""), (".", "p"), ("-", "m")):
+        text = text.replace(old, new)
+    return text
+
+
+def build_meansparse_name_tag(args, separator="-"):
+    if args.soft_threshold_alpha <= 0:
+        return ""
+    tag = (
+        f"{separator}msa{_format_variant_value(args.soft_threshold_alpha)}"
+        f"{separator}msb{_format_variant_value(args.soft_threshold_beta)}"
+    )
+    if args.soft_threshold_stat_eps != 1e-6:
+        tag = f"{tag}{separator}mseps{_format_variant_value(args.soft_threshold_stat_eps)}"
+    return tag
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate RobustBench models with and without RanPAC.")
     parser.add_argument("--model-names", "--model_names", nargs="+", required=True, help="RobustBench model names to evaluate.")
@@ -162,6 +181,9 @@ def parse_args():
     parser.add_argument("--adapt-noise-eps", "--adapt_noise_eps", type=float, default=0.0, help="Linf noise radius used while fitting HiRA and RanPAC adaptation statistics.")
     parser.add_argument("--adapt-noise-num", "--adapt_noise_num", type=int, default=0, help="Number of noisy samples per training image used while fitting HiRA and RanPAC.")
     parser.add_argument("--adapt-alpha", "--adapt_alpha", type=float, default=1.0, help="Total weight assigned to noisy adaptation statistics relative to clean statistics.")
+    parser.add_argument("--soft-threshold-alpha", "--soft_threshold_alpha", type=float, default=0.0, help="Width of the smooth mean-centered threshold in units of feature std; 0 disables it.")
+    parser.add_argument("--soft-threshold-beta", "--soft_threshold_beta", type=float, default=8.0, help="Sharpness of the smooth mean-centered threshold.")
+    parser.add_argument("--soft-threshold-stat-eps", "--soft_threshold_stat_eps", type=float, default=1e-6, help="Minimum feature std used by the smooth mean-centered threshold.")
     parser.add_argument(
         "--use-ranpac",
         "--use_ranpac",
@@ -794,6 +816,9 @@ def main():
                         adapt_noise_eps=args.adapt_noise_eps,
                         adapt_noise_num=args.adapt_noise_num,
                         adapt_alpha=args.adapt_alpha,
+                        soft_threshold_alpha=args.soft_threshold_alpha,
+                        soft_threshold_beta=args.soft_threshold_beta,
+                        soft_threshold_stat_eps=args.soft_threshold_stat_eps,
                     ).to(device).eval()
                     classifier_name = build_hira_variant_name(
                         classifier_name,
@@ -807,6 +832,9 @@ def main():
                         adapt_noise_eps=args.adapt_noise_eps,
                         adapt_noise_num=args.adapt_noise_num,
                         adapt_alpha=args.adapt_alpha,
+                        soft_threshold_alpha=args.soft_threshold_alpha,
+                        soft_threshold_beta=args.soft_threshold_beta,
+                        soft_threshold_stat_eps=args.soft_threshold_stat_eps,
                     )
                 if variant_cfg["use_ranpac"]:
                     reference_logits, reference_targets = _collect_logits(
@@ -830,6 +858,9 @@ def main():
                         adapt_noise_eps=args.adapt_noise_eps,
                         adapt_noise_num=args.adapt_noise_num,
                         adapt_alpha=args.adapt_alpha,
+                        soft_threshold_alpha=args.soft_threshold_alpha,
+                        soft_threshold_beta=args.soft_threshold_beta,
+                        soft_threshold_stat_eps=args.soft_threshold_stat_eps,
                         ranpac_lambda=args.ranpac_lambda,
                         ranpac_temp=args.ranpac_temp,
                         hardneg_topk=args.ranpac_hardneg_topk,
@@ -850,6 +881,8 @@ def main():
                         f"{benchmark_model_name}-htk{args.ranpac_hardneg_topk}"
                         f"-hg{str(args.ranpac_hardneg_gamma).replace('/', '_')}"
                     )
+                if (variant_cfg["use_hira"] or variant_cfg["use_ranpac"]) and args.soft_threshold_alpha > 0:
+                    benchmark_model_name = f"{benchmark_model_name}{build_meansparse_name_tag(args)}"
 
                 metrics = evaluate_variant(
                     model,
@@ -900,6 +933,9 @@ def main():
                         "adapt_noise_eps": args.adapt_noise_eps,
                         "adapt_noise_num": args.adapt_noise_num,
                         "adapt_alpha": args.adapt_alpha,
+                        "soft_threshold_alpha": args.soft_threshold_alpha,
+                        "soft_threshold_beta": args.soft_threshold_beta,
+                        "soft_threshold_stat_eps": args.soft_threshold_stat_eps,
                     }
                 )
                 results.append(metrics)

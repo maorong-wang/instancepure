@@ -75,6 +75,9 @@ def parse_args():
     parser.add_argument("--adapt_noise_eps", type=float, default=0.0, help="Linf noise radius used while fitting HiRA and RanPAC adaptation statistics")
     parser.add_argument("--adapt_noise_num", type=int, default=0, help="number of noisy samples per training image used while fitting HiRA and RanPAC")
     parser.add_argument("--adapt_alpha", type=float, default=1.0, help="total weight assigned to noisy adaptation statistics relative to clean statistics")
+    parser.add_argument("--soft_threshold_alpha", type=float, default=0.0, help="width of the smooth mean-centered threshold in units of feature std; 0 disables it")
+    parser.add_argument("--soft_threshold_beta", type=float, default=8.0, help="sharpness of the smooth mean-centered threshold")
+    parser.add_argument("--soft_threshold_stat_eps", type=float, default=1e-6, help="minimum feature std used by the smooth mean-centered threshold")
     parser.add_argument("--attack_method", default="Linf_pgd", type=str, help="attack model")
     parser.add_argument("--device", default="cuda:0", help="device, e.g. cuda:0")
     parser.add_argument("--use_ranpac_head", type=str2bool, default=False, help="replace the final linear layer with a RanPAC ridge head")
@@ -141,6 +144,18 @@ def build_adapt_noise_tag(args):
         f"_nnum{args.adapt_noise_num}"
         f"_na{_format_variant_noise_value(args.adapt_alpha)}"
     )
+
+
+def build_meansparse_tag(args):
+    if args.soft_threshold_alpha <= 0:
+        return ""
+    tag = (
+        f"_msa{_format_variant_noise_value(args.soft_threshold_alpha)}"
+        f"_msb{_format_variant_noise_value(args.soft_threshold_beta)}"
+    )
+    if args.soft_threshold_stat_eps != 1e-6:
+        tag = f"{tag}_mseps{_format_variant_noise_value(args.soft_threshold_stat_eps)}"
+    return tag
 
 
 def load_diffpure_stadv_attack():
@@ -406,6 +421,7 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
     device = resolve_device(device)
     classifier_variant = classifier
     adapt_noise_tag = build_adapt_noise_tag(args)
+    meansparse_tag = build_meansparse_tag(args)
     if args.use_hira_adapter:
         classifier_variant = f"{classifier_variant}_hira"
         if args.hira_num_blocks != 2:
@@ -423,6 +439,8 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
             )
     if adapt_noise_tag and (args.use_hira_adapter or args.use_ranpac_head):
         classifier_variant = f"{classifier_variant}{adapt_noise_tag}"
+    if meansparse_tag and (args.use_hira_adapter or args.use_ranpac_head):
+        classifier_variant = f"{classifier_variant}{meansparse_tag}"
     lora_dir = args.lora_input_dir or "no_lora"
 
     if args.load_origin_lora:
@@ -458,6 +476,9 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         adapt_noise_eps=args.adapt_noise_eps,
         adapt_noise_num=args.adapt_noise_num,
         adapt_alpha=args.adapt_alpha,
+        soft_threshold_alpha=args.soft_threshold_alpha,
+        soft_threshold_beta=args.soft_threshold_beta,
+        soft_threshold_stat_eps=args.soft_threshold_stat_eps,
         use_ranpac=args.use_ranpac_head,
         ranpac_rp_dim=args.ranpac_rp_dim,
         ranpac_batch_size=args.ranpac_batch_size,
@@ -593,6 +614,9 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         "adapt_noise_eps": args.adapt_noise_eps,
         "adapt_noise_num": args.adapt_noise_num,
         "adapt_alpha": args.adapt_alpha,
+        "soft_threshold_alpha": args.soft_threshold_alpha,
+        "soft_threshold_beta": args.soft_threshold_beta,
+        "soft_threshold_stat_eps": args.soft_threshold_stat_eps,
         "ranpac_lambda": args.ranpac_lambda,
         "ranpac_temp": args.ranpac_temp,
         "ranpac_baseline_bias_centered": args.use_ranpac_head,

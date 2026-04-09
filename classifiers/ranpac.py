@@ -9,28 +9,54 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
 
+from classifiers.mean_sparse import (
+    DEFAULT_MEANSPARSE_STAT_EPS,
+    apply_mean_centered_soft_threshold,
+    build_meansparse_tag,
+    format_cache_value,
+    is_meansparse_enabled,
+)
+
 RIDGE_CANDIDATES = [10.0 ** power for power in range(-8, 14)]
-RANPAC_CACHE_VERSION = 11
-
-
-def _format_cache_value(value):
-    text = str(value)
-    for old, new in (("/", "_"), (" ", ""), (".", "p"), ("-", "m")):
-        text = text.replace(old, new)
-    return text
+RANPAC_CACHE_VERSION = 12
 
 
 class RanPACLinear(nn.Module):
-    def __init__(self, in_features, out_features, rp_dim, weight, w_rand):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        rp_dim,
+        weight,
+        w_rand,
+        soft_threshold_mean,
+        soft_threshold_std,
+        soft_threshold_alpha,
+        soft_threshold_beta,
+        soft_threshold_stat_eps,
+    ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.rp_dim = rp_dim
         self.register_buffer("weight", weight)
         self.register_buffer("w_rand", w_rand)
+        self.register_buffer("soft_threshold_mean", soft_threshold_mean)
+        self.register_buffer("soft_threshold_std", soft_threshold_std)
+        self.soft_threshold_alpha = float(soft_threshold_alpha)
+        self.soft_threshold_beta = float(soft_threshold_beta)
+        self.soft_threshold_stat_eps = float(soft_threshold_stat_eps)
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
+        x = apply_mean_centered_soft_threshold(
+            x,
+            self.soft_threshold_mean,
+            self.soft_threshold_std,
+            alpha=self.soft_threshold_alpha,
+            beta=self.soft_threshold_beta,
+            stat_eps=self.soft_threshold_stat_eps,
+        )
         projected = F.gelu(x @ self.w_rand)
         return projected @ self.weight.t()
 
@@ -275,21 +301,127 @@ def _select_ridge_by_regression_loss(g_train, q_train, g_val, q_val, val_target_
     return best_ridge, best_loss
 
 
-def _estimate_baseline_logit_mean(model, loader, device, description):
+def _collect_train_statistics(
+    model,
+    linear_layer,
+    loader,
+    w_rand,
+    out_features,
+    device,
+    description,
+    adapt_noise_eps,
+    adapt_noise_num,
+    adapt_alpha,
+    hardneg_topk,
+    hardneg_gamma,
+    collect_feature_stats,
+    accumulate_ridge_stats,
+):
+    feature_buffer = []
+
+    def hook(_, inputs):
+        feature_buffer.append(inputs[0].detach())
+
+    handle = linear_layer.register_forward_pre_hook(hook)
     logit_sum = 0.0
     logit_count = 0
+    feature_sum = None
+    feature_sum_sq = None
+    feature_sample_count = 0
+    g_matrix = None
+    q_matrix = None
+    target_norm = 0.0
+    sample_count = 0.0
+    del adapt_alpha
+    use_noisy_adaptation = adapt_noise_num > 0 and adapt_noise_eps > 0
+    noisy_sample_weight = 1.0 / adapt_noise_num if use_noisy_adaptation else 0.0
 
-    model = model.eval()
-    with torch.no_grad():
-        for inputs, _ in tqdm(loader, desc=description):
-            inputs = inputs.to(device)
-            logits = model(inputs).float().cpu()
-            logit_sum += logits.sum().item()
-            logit_count += logits.numel()
+    try:
+        model = model.eval().to(device)
+        with torch.no_grad():
+            for inputs, targets in tqdm(loader, desc=description):
+                inputs = inputs.to(device)
+                targets = targets.to(device)
+                feature_buffer.clear()
+                clean_logits = model(inputs)
+                clean_features = feature_buffer.pop().view(inputs.size(0), -1).float().cpu()
+                logit_sum += clean_logits.float().sum().item()
+                logit_count += clean_logits.numel()
+
+                if collect_feature_stats:
+                    if feature_sum is None:
+                        feature_sum = torch.zeros(clean_features.size(1), dtype=torch.float64)
+                        feature_sum_sq = torch.zeros(clean_features.size(1), dtype=torch.float64)
+                    feature_sum += clean_features.sum(dim=0, dtype=torch.float64)
+                    feature_sum_sq += clean_features.square().sum(dim=0, dtype=torch.float64)
+                    feature_sample_count += clean_features.size(0)
+
+                if not accumulate_ridge_stats:
+                    continue
+
+                if g_matrix is None:
+                    g_matrix = torch.zeros(w_rand.size(1), w_rand.size(1), dtype=torch.float32)
+                    q_matrix = torch.zeros(w_rand.size(1), out_features, dtype=torch.float32)
+
+                if use_noisy_adaptation:
+                    for _ in range(adapt_noise_num):
+                        noisy_inputs = _sample_linf_noisy_inputs(inputs, adapt_noise_eps)
+                        feature_buffer.clear()
+                        noisy_logits = model(noisy_inputs)
+                        noisy_features = feature_buffer.pop().view(inputs.size(0), -1).cpu()
+                        noisy_projected = F.gelu(noisy_features @ w_rand)
+                        noisy_targets = _build_supervised_targets(
+                            noisy_logits,
+                            targets,
+                            out_features,
+                            hardneg_topk=hardneg_topk,
+                            hardneg_gamma=hardneg_gamma,
+                        )
+                        target_norm_value = noisy_targets.square().sum().item()
+                        g_matrix += noisy_sample_weight * (noisy_projected.t() @ noisy_projected)
+                        q_matrix += noisy_sample_weight * (noisy_projected.t() @ noisy_targets)
+                        target_norm += noisy_sample_weight * target_norm_value
+                        sample_count += noisy_sample_weight * noisy_targets.size(0)
+                else:
+                    projected = F.gelu(clean_features @ w_rand)
+                    supervised_targets = _build_supervised_targets(
+                        clean_logits,
+                        targets,
+                        out_features,
+                        hardneg_topk=hardneg_topk,
+                        hardneg_gamma=hardneg_gamma,
+                    )
+                    target_norm_value = supervised_targets.square().sum().item()
+                    g_matrix += projected.t() @ projected
+                    q_matrix += projected.t() @ supervised_targets
+                    target_norm += target_norm_value
+                    sample_count += supervised_targets.size(0)
+    finally:
+        handle.remove()
 
     if logit_count == 0:
-        raise ValueError("RanPAC baseline-logit-mean estimation loader is empty.")
-    return torch.tensor(logit_sum / float(logit_count), dtype=torch.float32)
+        raise ValueError("RanPAC train statistics loader is empty.")
+
+    baseline_logit_mean = torch.tensor(logit_sum / float(logit_count), dtype=torch.float32)
+    feature_mean = None
+    feature_std = None
+    if collect_feature_stats:
+        if feature_sample_count == 0:
+            raise ValueError("RanPAC soft-threshold statistics loader is empty.")
+        feature_mean = feature_sum / float(feature_sample_count)
+        feature_var = feature_sum_sq / float(feature_sample_count) - feature_mean.square()
+        feature_mean = feature_mean.float()
+        feature_std = feature_var.clamp_min(0.0).sqrt().float()
+
+    return {
+        "baseline_logit_mean": baseline_logit_mean,
+        "feature_mean": feature_mean,
+        "feature_std": feature_std,
+        "g_matrix": g_matrix,
+        "q_matrix": q_matrix,
+        "target_norm": target_norm,
+        "sample_count": sample_count,
+    }
 
 
 def _fit_ranpac_state(
@@ -310,6 +442,9 @@ def _fit_ranpac_state(
     adapt_alpha=1.0,
     hardneg_topk=9,
     hardneg_gamma=1.0,
+    soft_threshold_alpha=0.0,
+    soft_threshold_beta=8.0,
+    soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
 ):
     layer_name, linear_layer = _find_last_linear(model)
     in_features = linear_layer.in_features
@@ -330,26 +465,35 @@ def _fit_ranpac_state(
 
     model = model.eval().to(device)
     print(f"Fitting RanPAC head for {cache_path}...")
-    baseline_logit_mean = _estimate_baseline_logit_mean(
-        model,
-        train_loader,
-        device,
-        description="RanPAC baseline bias",
-    )
-    g_train, q_train, _, _ = _accumulate_statistics(
+    train_stats = _collect_train_statistics(
         model,
         linear_layer,
         train_loader,
         w_rand,
         out_features,
         device,
-        description="RanPAC train stats",
+        description=(
+            "RanPAC train baseline, ridge, and soft-threshold stats"
+            if is_meansparse_enabled(soft_threshold_alpha)
+            else "RanPAC train baseline and ridge stats"
+        ),
         adapt_noise_eps=adapt_noise_eps,
         adapt_noise_num=adapt_noise_num,
         adapt_alpha=adapt_alpha,
         hardneg_topk=hardneg_topk,
         hardneg_gamma=hardneg_gamma,
+        collect_feature_stats=is_meansparse_enabled(soft_threshold_alpha),
+        accumulate_ridge_stats=True,
     )
+    baseline_logit_mean = train_stats["baseline_logit_mean"]
+    if is_meansparse_enabled(soft_threshold_alpha):
+        soft_threshold_mean = train_stats["feature_mean"]
+        soft_threshold_std = train_stats["feature_std"]
+    else:
+        soft_threshold_mean = torch.zeros(in_features, dtype=torch.float32)
+        soft_threshold_std = torch.ones(in_features, dtype=torch.float32)
+    g_train = train_stats["g_matrix"]
+    q_train = train_stats["q_matrix"]
     if val_loader is not None:
         g_val, q_val, val_target_norm, val_sample_count = _accumulate_statistics(
             model,
@@ -409,6 +553,13 @@ def _fit_ranpac_state(
         "hardneg_gamma": hardneg_gamma,
         "baseline_logit_mean_source": "train_clean_global_scalar",
         "baseline_logit_mean": baseline_logit_mean,
+        "soft_threshold_enabled": is_meansparse_enabled(soft_threshold_alpha),
+        "soft_threshold_mean_source": "train_clean_feature_channel",
+        "soft_threshold_mean": soft_threshold_mean,
+        "soft_threshold_std": soft_threshold_std,
+        "soft_threshold_alpha": soft_threshold_alpha,
+        "soft_threshold_beta": soft_threshold_beta,
+        "soft_threshold_stat_eps": soft_threshold_stat_eps,
         "ridge": regression_ridge,
         "weight": weight,
         "w_rand": w_rand,
@@ -442,6 +593,9 @@ def apply_ranpac_head(
     ranpac_temp=1.0,
     hardneg_topk=9,
     hardneg_gamma=1.0,
+    soft_threshold_alpha=0.0,
+    soft_threshold_beta=8.0,
+    soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
 ):
     if train_loader is None and "imagenet" not in classifier_name:
         raise NotImplementedError("RanPAC head replacement is currently implemented for ImageNet classifiers only.")
@@ -461,6 +615,12 @@ def apply_ranpac_head(
         raise ValueError("RanPAC hardneg_topk must be non-negative.")
     if hardneg_gamma < 0:
         raise ValueError("RanPAC hardneg_gamma must be non-negative.")
+    if soft_threshold_alpha < 0:
+        raise ValueError("RanPAC soft_threshold_alpha must be non-negative.")
+    if is_meansparse_enabled(soft_threshold_alpha) and soft_threshold_beta <= 0:
+        raise ValueError("RanPAC soft_threshold_beta must be positive when soft thresholding is enabled.")
+    if soft_threshold_stat_eps <= 0:
+        raise ValueError("RanPAC soft_threshold_stat_eps must be positive.")
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -468,17 +628,23 @@ def apply_ranpac_head(
         device = torch.device(device)
 
     noise_tag = (
-        f"_neps{_format_cache_value(adapt_noise_eps)}"
+        f"_neps{format_cache_value(adapt_noise_eps)}"
         f"_nnum{adapt_noise_num}"
-        f"_na{_format_cache_value(adapt_alpha)}"
+        f"_na{format_cache_value(adapt_alpha)}"
     )
     hardneg_tag = (
         f"_htk{hardneg_topk}"
-        f"_hg{_format_cache_value(hardneg_gamma)}"
+        f"_hg{format_cache_value(hardneg_gamma)}"
+    )
+    meansparse_tag = build_meansparse_tag(
+        alpha=soft_threshold_alpha,
+        beta=soft_threshold_beta,
+        stat_eps=soft_threshold_stat_eps,
+        separator="_",
     )
     cache_name = (
         f"{classifier_name.replace('/', '_')}_rp{rp_dim}_seed{seed}"
-        f"{noise_tag}{hardneg_tag}_ranpac_v{RANPAC_CACHE_VERSION}.pt"
+        f"{noise_tag}{hardneg_tag}{meansparse_tag}_ranpac_v{RANPAC_CACHE_VERSION}.pt"
     )
     cache_path = os.path.join(cache_dir, cache_name)
 
@@ -504,6 +670,9 @@ def apply_ranpac_head(
                 adapt_alpha=adapt_alpha,
                 hardneg_topk=hardneg_topk,
                 hardneg_gamma=hardneg_gamma,
+                soft_threshold_alpha=soft_threshold_alpha,
+                soft_threshold_beta=soft_threshold_beta,
+                soft_threshold_stat_eps=soft_threshold_stat_eps,
             )
     else:
         state = _fit_ranpac_state(
@@ -524,6 +693,9 @@ def apply_ranpac_head(
             adapt_alpha=adapt_alpha,
             hardneg_topk=hardneg_topk,
             hardneg_gamma=hardneg_gamma,
+            soft_threshold_alpha=soft_threshold_alpha,
+            soft_threshold_beta=soft_threshold_beta,
+            soft_threshold_stat_eps=soft_threshold_stat_eps,
         )
 
     if state["layer_name"] != layer_name:
@@ -537,6 +709,11 @@ def apply_ranpac_head(
         rp_dim=state["rp_dim"],
         weight=state["weight"],
         w_rand=state["w_rand"],
+        soft_threshold_mean=state["soft_threshold_mean"],
+        soft_threshold_std=state["soft_threshold_std"],
+        soft_threshold_alpha=state["soft_threshold_alpha"],
+        soft_threshold_beta=state["soft_threshold_beta"],
+        soft_threshold_stat_eps=state.get("soft_threshold_stat_eps", DEFAULT_MEANSPARSE_STAT_EPS),
     )
     ranpac_head = ResidualRanPACLinear(
         original_linear=linear_layer,

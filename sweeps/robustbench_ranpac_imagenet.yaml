@@ -17,8 +17,6 @@ parameters:
   model_names:
     values:
       - Liu2023Comprehensive_Swin-L
-        #- Xu2024MIMIR_Swin-L
-        #- Amini2024MeanSparse_Swin-L
   use_hira:
     values: [false]
   use_ranpac:
@@ -71,12 +69,18 @@ parameters:
     value: 1
   adapt_alpha:
     value: 1
+  soft_threshold_alpha:
+    values: [0.0, 0.1, 0.2, 0.35, 0.5]
+  soft_threshold_beta:
+    values: [2.0, 4.0, 8.0, 16.0]
+  soft_threshold_stat_eps:
+    value: 1.0e-6
   ranpac_rp_dim:
     values: [10000]
   ranpac_lambda:
     values: [.1, .2, .25, .5, .75]
   ranpac_temp:
-    value: 1.0
+    value: 0.10
   ranpac_hardneg_topk:
     value: 0
   ranpac_hardneg_gamma:

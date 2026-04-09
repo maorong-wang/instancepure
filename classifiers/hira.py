@@ -10,18 +10,18 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
+from classifiers.mean_sparse import (
+    DEFAULT_MEANSPARSE_STAT_EPS,
+    apply_mean_centered_soft_threshold,
+    build_meansparse_tag,
+    format_cache_value,
+    is_meansparse_enabled,
+)
 from classifiers.ranpac import RIDGE_CANDIDATES
 from dataset import get_dataset
 
 
-HIRA_CACHE_VERSION = 26
-
-
-def _format_cache_value(value):
-    text = str(value)
-    for old, new in (("/", "_"), (" ", ""), (".", "p"), ("-", "m")):
-        text = text.replace(old, new)
-    return text
+HIRA_CACHE_VERSION = 27
 
 
 class HiRAHalfPrecisionWrapper(nn.Module):
@@ -39,10 +39,23 @@ class HiRAHalfPrecisionWrapper(nn.Module):
 
 
 class HiRAAdapter(nn.Module):
-    def __init__(self, in_features, out_features, expansion_dim):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        expansion_dim,
+        soft_threshold_alpha=0.0,
+        soft_threshold_beta=8.0,
+        soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+    ):
         super().__init__()
         self.register_buffer("b_rand", torch.randn(in_features, expansion_dim, dtype=torch.float16))
         self.a_weight = nn.Parameter(torch.empty(out_features, expansion_dim, dtype=torch.float16))
+        self.register_buffer("soft_threshold_mean", torch.zeros(in_features, dtype=torch.float32))
+        self.register_buffer("soft_threshold_std", torch.ones(in_features, dtype=torch.float32))
+        self.soft_threshold_alpha = float(soft_threshold_alpha)
+        self.soft_threshold_beta = float(soft_threshold_beta)
+        self.soft_threshold_stat_eps = float(soft_threshold_stat_eps)
         self.force_fp32 = False
         self._fp32_cache_device = None
         self._b_rand_fp32 = None
@@ -64,6 +77,14 @@ class HiRAAdapter(nn.Module):
 
     def project(self, x):
         token_features = x.reshape(-1, x.shape[-1])
+        token_features = apply_mean_centered_soft_threshold(
+            token_features,
+            self.soft_threshold_mean,
+            self.soft_threshold_std,
+            alpha=self.soft_threshold_alpha,
+            beta=self.soft_threshold_beta,
+            stat_eps=self.soft_threshold_stat_eps,
+        )
         if self.force_fp32:
             token_features = token_features.float()
             if token_features.device.type == "cuda":
@@ -91,11 +112,25 @@ class HiRAAdapter(nn.Module):
 
 
 class HiRAMlpWrapper(nn.Module):
-    def __init__(self, base_mlp, expansion_dim):
+    def __init__(
+        self,
+        base_mlp,
+        expansion_dim,
+        soft_threshold_alpha=0.0,
+        soft_threshold_beta=8.0,
+        soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+    ):
         super().__init__()
         self.base_mlp = base_mlp
         mlp_output_dim = _infer_mlp_output_dim(base_mlp)
-        self.mlp_adapter = HiRAAdapter(mlp_output_dim, mlp_output_dim, expansion_dim)
+        self.mlp_adapter = HiRAAdapter(
+            mlp_output_dim,
+            mlp_output_dim,
+            expansion_dim,
+            soft_threshold_alpha=soft_threshold_alpha,
+            soft_threshold_beta=soft_threshold_beta,
+            soft_threshold_stat_eps=soft_threshold_stat_eps,
+        )
 
     def post_fc2(self, x):
         x = self.base_mlp.fc1(x)
@@ -158,13 +193,33 @@ def _resolve_target_mlp_modules(model, num_adapter_blocks):
     return mlp_modules[-num_adapter_blocks:]
 
 
-def _attach_hira_modules(model, expansion_dim, num_adapter_blocks):
+def _attach_hira_modules(
+    model,
+    expansion_dim,
+    num_adapter_blocks,
+    soft_threshold_alpha=0.0,
+    soft_threshold_beta=8.0,
+    soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+):
     target_mlp_names = []
     for module_name, module in _resolve_target_mlp_modules(model, num_adapter_blocks):
         if isinstance(module, HiRAMlpWrapper):
+            module.mlp_adapter.soft_threshold_alpha = float(soft_threshold_alpha)
+            module.mlp_adapter.soft_threshold_beta = float(soft_threshold_beta)
+            module.mlp_adapter.soft_threshold_stat_eps = float(soft_threshold_stat_eps)
             target_mlp_names.append(module_name)
             continue
-        _set_module_by_name(model, module_name, HiRAMlpWrapper(module, expansion_dim))
+        _set_module_by_name(
+            model,
+            module_name,
+            HiRAMlpWrapper(
+                module,
+                expansion_dim,
+                soft_threshold_alpha=soft_threshold_alpha,
+                soft_threshold_beta=soft_threshold_beta,
+                soft_threshold_stat_eps=soft_threshold_stat_eps,
+            ),
+        )
         target_mlp_names.append(module_name)
     return target_mlp_names
 
@@ -235,15 +290,24 @@ def build_hira_variant_name(
     adapt_noise_eps=0.0,
     adapt_noise_num=0,
     adapt_alpha=1.0,
+    soft_threshold_alpha=0.0,
+    soft_threshold_beta=8.0,
+    soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
 ):
     del epochs, lr, weight_decay
 
     sample_tag = "full" if max_train_samples is None or max_train_samples < 0 else str(max_train_samples)
     block_tag = _format_block_tag(num_adapter_blocks, "-blk")
     noise_tag = (
-        f"-neps{_format_cache_value(adapt_noise_eps)}"
+        f"-neps{format_cache_value(adapt_noise_eps)}"
         f"-nnum{adapt_noise_num}"
-        f"-na{_format_cache_value(adapt_alpha)}"
+        f"-na{format_cache_value(adapt_alpha)}"
+    )
+    meansparse_tag = build_meansparse_tag(
+        alpha=soft_threshold_alpha,
+        beta=soft_threshold_beta,
+        stat_eps=soft_threshold_stat_eps,
+        separator="-",
     )
     return (
         f"{classifier_name}-hira-v{HIRA_CACHE_VERSION}-post-fc2-closedform-gelu"
@@ -252,6 +316,7 @@ def build_hira_variant_name(
         f"-ns{sample_tag}"
         f"-seed{seed}"
         f"{noise_tag}"
+        f"{meansparse_tag}"
     )
 
 
@@ -267,6 +332,9 @@ def _build_cache_name(
     adapt_noise_eps,
     adapt_noise_num,
     adapt_alpha,
+    soft_threshold_alpha,
+    soft_threshold_beta,
+    soft_threshold_stat_eps,
 ):
     return build_hira_variant_name(
         classifier_name=classifier_name,
@@ -280,6 +348,9 @@ def _build_cache_name(
         adapt_noise_eps=adapt_noise_eps,
         adapt_noise_num=adapt_noise_num,
         adapt_alpha=adapt_alpha,
+        soft_threshold_alpha=soft_threshold_alpha,
+        soft_threshold_beta=soft_threshold_beta,
+        soft_threshold_stat_eps=soft_threshold_stat_eps,
     ).replace("/", "_") + ".pt"
 
 
@@ -328,22 +399,43 @@ def _build_train_loaders(dataset_root, batch_size, num_workers, seed, max_train_
     )
 
 
-def _init_hira_statistics(model, mlp_module_names, stats_device):
+def _init_hira_statistics(model, mlp_module_names, stats_device, collect_feature_stats=False):
     statistics = {}
     for module_name in mlp_module_names:
         wrapper = _get_module_by_name(model, module_name)
         rp_dim = wrapper.mlp_adapter.b_rand.size(1)
         out_dim = wrapper.mlp_adapter.a_weight.size(0)
-        statistics[module_name] = {
+        entry = {
             "g_matrix": torch.zeros(rp_dim, rp_dim, dtype=torch.float32, device=stats_device),
             "q_matrix": torch.zeros(rp_dim, out_dim, dtype=torch.float32, device=stats_device),
             "target_norm": torch.zeros((), dtype=torch.float32, device=stats_device),
             "sample_count": 0.0,
         }
+        if collect_feature_stats:
+            entry["feature_sum"] = torch.zeros(out_dim, dtype=torch.float64, device=stats_device)
+            entry["feature_sum_sq"] = torch.zeros(out_dim, dtype=torch.float64, device=stats_device)
+            entry["feature_sample_count"] = 0
+        statistics[module_name] = entry
     return statistics
 
 
-def _accumulate_projected_statistics(entry, b_rand, source_tokens, target_tokens, weight):
+def _accumulate_feature_statistics(entry, source_tokens):
+    if "feature_sum" not in entry:
+        return
+
+    source_tokens = source_tokens.to(dtype=torch.float64)
+    entry["feature_sum"] += source_tokens.sum(dim=0)
+    entry["feature_sum_sq"] += source_tokens.square().sum(dim=0)
+    entry["feature_sample_count"] += source_tokens.size(0)
+
+
+def _accumulate_projected_statistics(
+    entry,
+    b_rand,
+    source_tokens,
+    target_tokens,
+    weight,
+):
     if weight <= 0:
         return
 
@@ -402,9 +494,15 @@ def _accumulate_hira_statistics(
     adapt_noise_eps,
     adapt_noise_num,
     adapt_alpha,
+    collect_feature_stats=False,
 ):
     stats_device = device if device.type == "cuda" else torch.device("cpu")
-    statistics = _init_hira_statistics(model, mlp_module_names, stats_device)
+    statistics = _init_hira_statistics(
+        model,
+        mlp_module_names,
+        stats_device,
+        collect_feature_stats=collect_feature_stats,
+    )
     b_rand_by_module = {
         module_name: _get_module_by_name(model, module_name).mlp_adapter.b_rand.to(
             device=stats_device,
@@ -439,6 +537,25 @@ def _accumulate_hira_statistics(
         with torch.no_grad():
             for inputs, _ in tqdm(loader, desc=description):
                 inputs = inputs.to(device, non_blocking=True)
+                if collect_feature_stats or not use_noisy_adaptation:
+                    batch_cache.clear()
+                    _run_teacher_forward(inputs)
+                    for module_name in mlp_module_names:
+                        clean_outputs = batch_cache[module_name].reshape(-1, batch_cache[module_name].shape[-1]).to(
+                            stats_device,
+                            dtype=torch.float32,
+                        )
+                        if collect_feature_stats:
+                            _accumulate_feature_statistics(statistics[module_name], clean_outputs)
+                        if not use_noisy_adaptation:
+                            _accumulate_projected_statistics(
+                                statistics[module_name],
+                                b_rand_by_module[module_name],
+                                clean_outputs,
+                                clean_outputs,
+                                weight=1.0,
+                            )
+
                 if use_noisy_adaptation:
                     for _ in range(adapt_noise_num):
                         noisy_inputs = _sample_linf_noisy_inputs(inputs, adapt_noise_eps)
@@ -456,25 +573,20 @@ def _accumulate_hira_statistics(
                                 noisy_outputs,
                                 noisy_outputs,
                                 weight=noisy_sample_weight,
-                            )
-                else:
-                    batch_cache.clear()
-                    _run_teacher_forward(inputs)
-                    for module_name in mlp_module_names:
-                        clean_outputs = batch_cache[module_name].reshape(-1, batch_cache[module_name].shape[-1]).to(
-                            stats_device,
-                            dtype=torch.float32,
-                        )
-                        _accumulate_projected_statistics(
-                            statistics[module_name],
-                            b_rand_by_module[module_name],
-                            clean_outputs,
-                            clean_outputs,
-                            weight=1.0,
                         )
     finally:
         for handle in handles:
             handle.remove()
+
+    if collect_feature_stats:
+        for module_name in mlp_module_names:
+            entry = statistics[module_name]
+            if entry["feature_sample_count"] == 0:
+                raise ValueError(f"HiRA soft-threshold statistics loader is empty for {module_name}.")
+            feature_mean = entry["feature_sum"] / float(entry["feature_sample_count"])
+            feature_var = entry["feature_sum_sq"] / float(entry["feature_sample_count"]) - feature_mean.square()
+            entry["soft_threshold_mean"] = feature_mean.float().cpu()
+            entry["soft_threshold_std"] = feature_var.clamp_min(0.0).sqrt().float().cpu()
 
     return statistics
 
@@ -489,6 +601,9 @@ def _fit_hira_weights_closed_form(
     adapt_noise_eps,
     adapt_noise_num,
     adapt_alpha,
+    soft_threshold_alpha,
+    soft_threshold_beta,
+    soft_threshold_stat_eps,
 ):
     train_stats = _accumulate_hira_statistics(
         model,
@@ -500,6 +615,7 @@ def _fit_hira_weights_closed_form(
         adapt_noise_eps=adapt_noise_eps,
         adapt_noise_num=adapt_noise_num,
         adapt_alpha=adapt_alpha,
+        collect_feature_stats=is_meansparse_enabled(soft_threshold_alpha),
     )
     val_stats = _accumulate_hira_statistics(
         model,
@@ -519,6 +635,17 @@ def _fit_hira_weights_closed_form(
         train_entry = train_stats[module_name]
         val_entry = val_stats[module_name]
         out_features = wrapper.mlp_adapter.a_weight.size(0)
+
+        if is_meansparse_enabled(soft_threshold_alpha):
+            soft_threshold_mean = train_entry["soft_threshold_mean"]
+            soft_threshold_std = train_entry["soft_threshold_std"]
+        else:
+            soft_threshold_mean = torch.zeros(out_features, dtype=torch.float32)
+            soft_threshold_std = torch.ones(out_features, dtype=torch.float32)
+
+        with torch.no_grad():
+            wrapper.mlp_adapter.soft_threshold_mean.copy_(soft_threshold_mean)
+            wrapper.mlp_adapter.soft_threshold_std.copy_(soft_threshold_std)
 
         ridge, regression_loss = _select_ridge_by_regression_loss(
             train_entry["g_matrix"],
@@ -572,6 +699,9 @@ def apply_hira_adaptation(
     adapt_noise_eps=0.0,
     adapt_noise_num=0,
     adapt_alpha=1.0,
+    soft_threshold_alpha=0.0,
+    soft_threshold_beta=8.0,
+    soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
 ):
     if adapt_noise_eps < 0:
         raise ValueError("HiRA adapt_noise_eps must be non-negative.")
@@ -579,6 +709,12 @@ def apply_hira_adaptation(
         raise ValueError("HiRA adapt_noise_num must be non-negative.")
     if adapt_alpha < 0:
         raise ValueError("HiRA adapt_alpha must be non-negative.")
+    if soft_threshold_alpha < 0:
+        raise ValueError("HiRA soft_threshold_alpha must be non-negative.")
+    if is_meansparse_enabled(soft_threshold_alpha) and soft_threshold_beta <= 0:
+        raise ValueError("HiRA soft_threshold_beta must be positive when soft thresholding is enabled.")
+    if soft_threshold_stat_eps <= 0:
+        raise ValueError("HiRA soft_threshold_stat_eps must be positive.")
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -587,7 +723,14 @@ def apply_hira_adaptation(
 
     teacher_model = copy.deepcopy(model).eval()
     _seed_everything(seed)
-    mlp_module_names = _attach_hira_modules(model, expansion_dim, num_adapter_blocks)
+    mlp_module_names = _attach_hira_modules(
+        model,
+        expansion_dim,
+        num_adapter_blocks,
+        soft_threshold_alpha=soft_threshold_alpha,
+        soft_threshold_beta=soft_threshold_beta,
+        soft_threshold_stat_eps=soft_threshold_stat_eps,
+    )
     _freeze_model(model)
 
     os.makedirs(cache_dir, exist_ok=True)
@@ -605,13 +748,17 @@ def apply_hira_adaptation(
             adapt_noise_eps=adapt_noise_eps,
             adapt_noise_num=adapt_noise_num,
             adapt_alpha=adapt_alpha,
+            soft_threshold_alpha=soft_threshold_alpha,
+            soft_threshold_beta=soft_threshold_beta,
+            soft_threshold_stat_eps=soft_threshold_stat_eps,
         ),
     )
 
     if os.path.exists(cache_path) and not force_retrain:
         state = torch.load(cache_path, map_location="cpu")
-        model.load_state_dict(state["hira_state"], strict=False)
-        return _prepare_hira_model_for_eval(model)
+        if state.get("version") == HIRA_CACHE_VERSION and "hira_state" in state:
+            model.load_state_dict(state["hira_state"], strict=False)
+            return _prepare_hira_model_for_eval(model)
 
     print(f"Fitting HiRA replacement layers for {cache_path}...")
     train_loader, val_loader = _build_train_loaders(
@@ -632,6 +779,9 @@ def apply_hira_adaptation(
         adapt_noise_eps=adapt_noise_eps,
         adapt_noise_num=adapt_noise_num,
         adapt_alpha=adapt_alpha,
+        soft_threshold_alpha=soft_threshold_alpha,
+        soft_threshold_beta=soft_threshold_beta,
+        soft_threshold_stat_eps=soft_threshold_stat_eps,
     )
 
     state = {
@@ -644,6 +794,10 @@ def apply_hira_adaptation(
         "adapt_noise_eps": adapt_noise_eps,
         "adapt_noise_num": adapt_noise_num,
         "adapt_alpha": adapt_alpha,
+        "soft_threshold_enabled": is_meansparse_enabled(soft_threshold_alpha),
+        "soft_threshold_alpha": soft_threshold_alpha,
+        "soft_threshold_beta": soft_threshold_beta,
+        "soft_threshold_stat_eps": soft_threshold_stat_eps,
         "mlp_module_names": mlp_module_names,
         "fit_method": "ridge_regression",
         "ridge_candidates": RIDGE_CANDIDATES,
