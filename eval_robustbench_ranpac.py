@@ -32,7 +32,12 @@ from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
 from classifiers.hira import apply_hira_adaptation, build_hira_variant_name
-from classifiers.ranpac import apply_ranpac_head
+from classifiers.ranpac import (
+    DEFAULT_RANPAC_FEATURE_STAT_EPS,
+    RANPAC_FEATURE_MODES,
+    apply_ranpac_head,
+    build_ranpac_feature_mode_tag,
+)
 from classifiers.stability_ridge import (
     DEFAULT_STABILITY_RIDGE_STAT_EPS,
     build_stability_ridge_tag,
@@ -104,6 +109,14 @@ def build_stability_ridge_name_tag(args, separator="-"):
     return build_stability_ridge_tag(
         gamma=args.stability_ridge_gamma,
         stat_eps=args.stability_ridge_stat_eps,
+        separator=separator,
+    )
+
+
+def build_ranpac_feature_name_tag(args, separator="-"):
+    return build_ranpac_feature_mode_tag(
+        feature_mode=args.ranpac_feature_mode,
+        feature_stat_eps=args.ranpac_feature_stat_eps,
         separator=separator,
     )
 
@@ -206,6 +219,20 @@ def parse_args():
         help="If set, evaluate only the original model (false) or only the RanPAC model (true).",
     )
     parser.add_argument("--ranpac-rp-dim", "--ranpac_rp_dim", type=int, default=5000, help="RanPAC random projection dimension.")
+    parser.add_argument(
+        "--ranpac-feature-mode",
+        "--ranpac_feature_mode",
+        choices=RANPAC_FEATURE_MODES,
+        default="gelu",
+        help="Projected feature transform used by the RanPAC ridge head.",
+    )
+    parser.add_argument(
+        "--ranpac-feature-stat-eps",
+        "--ranpac_feature_stat_eps",
+        type=float,
+        default=DEFAULT_RANPAC_FEATURE_STAT_EPS,
+        help="Minimum projected-feature std used by non-default RanPAC feature transforms.",
+    )
     parser.add_argument(
         "--ranpac-fit-batch-size",
         "--ranpac_fit_batch_size",
@@ -870,6 +897,8 @@ def main():
                         num_workers=args.num_workers,
                         seed=args.seed,
                         selection_method=variant_cfg["ranpac_selection_method"],
+                        feature_mode=args.ranpac_feature_mode,
+                        feature_stat_eps=args.ranpac_feature_stat_eps,
                         device=device,
                         cache_dir=args.ranpac_cache_dir,
                         train_transform=model_preprocessing,
@@ -901,6 +930,8 @@ def main():
                         f"{benchmark_model_name}-htk{args.ranpac_hardneg_topk}"
                         f"-hg{str(args.ranpac_hardneg_gamma).replace('/', '_')}"
                     )
+                if variant_cfg["use_ranpac"]:
+                    benchmark_model_name = f"{benchmark_model_name}{build_ranpac_feature_name_tag(args)}"
                 if (variant_cfg["use_hira"] or variant_cfg["use_ranpac"]) and args.soft_threshold_alpha > 0:
                     benchmark_model_name = f"{benchmark_model_name}{build_meansparse_name_tag(args)}"
                 if variant_cfg["use_hira"] or variant_cfg["use_ranpac"]:
@@ -947,6 +978,8 @@ def main():
                         "hira_num_blocks": args.hira_num_blocks if variant_cfg["use_hira"] else None,
                         "use_ranpac": variant_cfg["use_ranpac"],
                         "ranpac_selection_method": variant_cfg["ranpac_selection_method"],
+                        "ranpac_feature_mode": args.ranpac_feature_mode,
+                        "ranpac_feature_stat_eps": args.ranpac_feature_stat_eps,
                         "ranpac_lambda": args.ranpac_lambda,
                         "ranpac_temp": args.ranpac_temp,
                         "ranpac_baseline_bias_centered": variant_cfg["use_ranpac"],

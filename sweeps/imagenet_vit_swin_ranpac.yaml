@@ -68,6 +68,10 @@ parameters:
     value: 1.0e-6
   ranpac_rp_dim:
     value: 8192
+  ranpac_feature_mode:
+    values: [gelu, gelu_zscore_l2_centered]
+  ranpac_feature_stat_eps:
+    value: 1.0e-6
   ranpac_lambda:
     value: 1.0
   ranpac_temp:

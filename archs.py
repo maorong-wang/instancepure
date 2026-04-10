@@ -6,7 +6,11 @@ import torchvision
 
 from classifiers.hira import apply_hira_adaptation, build_hira_variant_name
 from classifiers.mean_sparse import DEFAULT_MEANSPARSE_STAT_EPS
-from classifiers.ranpac import apply_ranpac_head
+from classifiers.ranpac import (
+    DEFAULT_RANPAC_FEATURE_STAT_EPS,
+    RANPAC_FEATURE_MODE_GELU,
+    apply_ranpac_head,
+)
 from classifiers.stability_ridge import DEFAULT_STABILITY_RIDGE_STAT_EPS
 
 
@@ -175,6 +179,8 @@ def get_archs(
     ranpac_num_workers=4,
     ranpac_seed=0,
     ranpac_selection_method="regression",
+    ranpac_feature_mode=RANPAC_FEATURE_MODE_GELU,
+    ranpac_feature_stat_eps=DEFAULT_RANPAC_FEATURE_STAT_EPS,
     ranpac_lambda=1.0,
     ranpac_temp=1.0,
     ranpac_hardneg_topk=9,
@@ -248,6 +254,8 @@ def get_archs(
             num_workers=ranpac_num_workers,
             seed=ranpac_seed,
             selection_method=ranpac_selection_method,
+            feature_mode=ranpac_feature_mode,
+            feature_stat_eps=ranpac_feature_stat_eps,
             device=device,
             cache_dir=ranpac_cache_dir,
             adapt_noise_eps=adapt_noise_eps,
