@@ -16,9 +16,16 @@ from classifiers.mean_sparse import (
     is_meansparse_enabled,
     strip_meansparse_tag,
 )
+from classifiers.stability_ridge import (
+    DEFAULT_STABILITY_RIDGE_STAT_EPS,
+    build_stability_ridge_tag,
+    compute_stability_ridge_prior,
+    is_stability_ridge_enabled,
+    solve_ridge_system,
+)
 
 RIDGE_CANDIDATES = [10.0 ** power for power in range(-8, 14)]
-RANPAC_CACHE_VERSION = 15
+RANPAC_CACHE_VERSION = 16
 
 
 class RanPACLinear(nn.Module):
@@ -273,12 +280,21 @@ def _accumulate_statistics(
     return g_matrix, q_matrix, target_norm, sample_count
 
 
-def _select_ridge_by_regression_loss(g_train, q_train, g_val, q_val, val_target_norm, num_classes, val_sample_count, device):
+def _select_ridge_by_regression_loss(
+    g_train,
+    q_train,
+    g_val,
+    q_val,
+    val_target_norm,
+    num_classes,
+    val_sample_count,
+    device,
+    diagonal_prior=None,
+):
     g_train = g_train.to(device)
     q_train = q_train.to(device)
     g_val = g_val.to(device)
     q_val = q_val.to(device)
-    eye = torch.eye(g_train.size(0), device=device, dtype=g_train.dtype)
 
     best_ridge = RIDGE_CANDIDATES[0]
     best_loss = None
@@ -286,7 +302,7 @@ def _select_ridge_by_regression_loss(g_train, q_train, g_val, q_val, val_target_
 
     with torch.no_grad():
         for ridge in RIDGE_CANDIDATES:
-            weights = torch.linalg.solve(g_train + ridge * eye, q_train).t()
+            weights = solve_ridge_system(g_train, q_train, ridge, diagonal_prior=diagonal_prior).t()
             if val_sample_count == 0:
                 continue
 
@@ -316,6 +332,7 @@ def _collect_train_statistics(
     hardneg_gamma,
     collect_feature_stats,
     accumulate_ridge_stats,
+    collect_projected_stability_stats,
 ):
     feature_buffer = []
 
@@ -328,6 +345,10 @@ def _collect_train_statistics(
     feature_sum = None
     feature_sum_sq = None
     feature_sample_count = 0
+    projected_sum = None
+    projected_sum_sq = None
+    projected_abs_sum = None
+    projected_sample_count = 0.0
     g_matrix = None
     q_matrix = None
     target_norm = 0.0
@@ -356,12 +377,17 @@ def _collect_train_statistics(
                     feature_sum_sq += clean_features.square().sum(dim=0, dtype=torch.float64)
                     feature_sample_count += clean_features.size(0)
 
-                if not accumulate_ridge_stats:
+                if not accumulate_ridge_stats and not collect_projected_stability_stats:
                     continue
 
                 if g_matrix is None:
                     g_matrix = torch.zeros(w_rand.size(1), w_rand.size(1), dtype=torch.float32)
                     q_matrix = torch.zeros(w_rand.size(1), out_features, dtype=torch.float32)
+
+                if collect_projected_stability_stats and projected_sum is None:
+                    projected_sum = torch.zeros(w_rand.size(1), dtype=torch.float64)
+                    projected_sum_sq = torch.zeros(w_rand.size(1), dtype=torch.float64)
+                    projected_abs_sum = torch.zeros(w_rand.size(1), dtype=torch.float64)
 
                 if use_noisy_adaptation:
                     for _ in range(adapt_noise_num):
@@ -370,6 +396,13 @@ def _collect_train_statistics(
                         noisy_logits = model(noisy_inputs)
                         noisy_features = feature_buffer.pop().view(inputs.size(0), -1).cpu()
                         noisy_projected = F.gelu(noisy_features @ w_rand)
+                        if collect_projected_stability_stats:
+                            projected_sum += noisy_sample_weight * noisy_projected.sum(dim=0, dtype=torch.float64)
+                            projected_sum_sq += noisy_sample_weight * noisy_projected.square().sum(dim=0, dtype=torch.float64)
+                            projected_abs_sum += noisy_sample_weight * noisy_projected.abs().sum(dim=0, dtype=torch.float64)
+                            projected_sample_count += noisy_sample_weight * noisy_projected.size(0)
+                        if not accumulate_ridge_stats:
+                            continue
                         noisy_targets = _build_supervised_targets(
                             noisy_logits,
                             targets,
@@ -384,6 +417,13 @@ def _collect_train_statistics(
                         sample_count += noisy_sample_weight * noisy_targets.size(0)
                 else:
                     projected = F.gelu(clean_features @ w_rand)
+                    if collect_projected_stability_stats:
+                        projected_sum += projected.sum(dim=0, dtype=torch.float64)
+                        projected_sum_sq += projected.square().sum(dim=0, dtype=torch.float64)
+                        projected_abs_sum += projected.abs().sum(dim=0, dtype=torch.float64)
+                        projected_sample_count += projected.size(0)
+                    if not accumulate_ridge_stats:
+                        continue
                     supervised_targets = _build_supervised_targets(
                         clean_logits,
                         targets,
@@ -421,6 +461,10 @@ def _collect_train_statistics(
         "q_matrix": q_matrix,
         "target_norm": target_norm,
         "sample_count": sample_count,
+        "projected_sum": projected_sum,
+        "projected_sum_sq": projected_sum_sq,
+        "projected_abs_sum": projected_abs_sum,
+        "projected_sample_count": projected_sample_count,
     }
 
 
@@ -445,6 +489,8 @@ def _fit_ranpac_state(
     soft_threshold_alpha=0.0,
     soft_threshold_beta=8.0,
     soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+    stability_ridge_gamma=0.0,
+    stability_ridge_stat_eps=DEFAULT_STABILITY_RIDGE_STAT_EPS,
 ):
     layer_name, linear_layer = _find_last_linear(model)
     in_features = linear_layer.in_features
@@ -484,12 +530,21 @@ def _fit_ranpac_state(
         hardneg_gamma=hardneg_gamma,
         collect_feature_stats=True,
         accumulate_ridge_stats=True,
+        collect_projected_stability_stats=is_stability_ridge_enabled(stability_ridge_gamma),
     )
     baseline_logit_mean = train_stats["baseline_logit_mean"]
     soft_threshold_mean = train_stats["feature_mean"]
     soft_threshold_std = train_stats["feature_std"]
     g_train = train_stats["g_matrix"]
     q_train = train_stats["q_matrix"]
+    stability_diagonal_prior = compute_stability_ridge_prior(
+        train_stats["projected_sum"],
+        train_stats["projected_sum_sq"],
+        train_stats["projected_abs_sum"],
+        train_stats["projected_sample_count"],
+        stability_ridge_gamma,
+        stability_ridge_stat_eps,
+    )
     if val_loader is not None:
         g_val, q_val, val_target_norm, val_sample_count = _accumulate_statistics(
             model,
@@ -520,6 +575,7 @@ def _fit_ranpac_state(
         out_features,
         val_sample_count,
         device,
+        diagonal_prior=stability_diagonal_prior,
     )
 
     print(f"RanPAC optimal ridge (regression): {regression_ridge}")
@@ -528,8 +584,7 @@ def _fit_ranpac_state(
 
     g_full = (g_train + g_val).to(device)
     q_full = (q_train + q_val).to(device)
-    eye = torch.eye(g_full.size(0), device=device, dtype=g_full.dtype)
-    weight = torch.linalg.solve(g_full + regression_ridge * eye, q_full).t().cpu()
+    weight = solve_ridge_system(g_full, q_full, regression_ridge, diagonal_prior=stability_diagonal_prior).t().cpu()
 
     state = {
         "version": RANPAC_CACHE_VERSION,
@@ -557,6 +612,10 @@ def _fit_ranpac_state(
         "soft_threshold_alpha": soft_threshold_alpha,
         "soft_threshold_beta": soft_threshold_beta,
         "soft_threshold_stat_eps": soft_threshold_stat_eps,
+        "stability_ridge_enabled": is_stability_ridge_enabled(stability_ridge_gamma),
+        "stability_ridge_gamma": stability_ridge_gamma,
+        "stability_ridge_stat_eps": stability_ridge_stat_eps,
+        "stability_ridge_source": "train_projected_feature_snr",
         "ridge": regression_ridge,
         "weight": weight,
         "w_rand": w_rand,
@@ -593,6 +652,8 @@ def apply_ranpac_head(
     soft_threshold_alpha=0.0,
     soft_threshold_beta=8.0,
     soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+    stability_ridge_gamma=0.0,
+    stability_ridge_stat_eps=DEFAULT_STABILITY_RIDGE_STAT_EPS,
 ):
     if train_loader is None and "imagenet" not in classifier_name:
         raise NotImplementedError("RanPAC head replacement is currently implemented for ImageNet classifiers only.")
@@ -618,6 +679,10 @@ def apply_ranpac_head(
         raise ValueError("RanPAC soft_threshold_beta must be positive when soft thresholding is enabled.")
     if soft_threshold_stat_eps <= 0:
         raise ValueError("RanPAC soft_threshold_stat_eps must be positive.")
+    if stability_ridge_gamma < 0:
+        raise ValueError("RanPAC stability_ridge_gamma must be non-negative.")
+    if stability_ridge_stat_eps <= 0:
+        raise ValueError("RanPAC stability_ridge_stat_eps must be positive.")
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -633,10 +698,15 @@ def apply_ranpac_head(
         f"_htk{hardneg_topk}"
         f"_hg{format_cache_value(hardneg_gamma)}"
     )
+    stability_tag = build_stability_ridge_tag(
+        gamma=stability_ridge_gamma,
+        stat_eps=stability_ridge_stat_eps,
+        separator="_",
+    )
     cache_classifier_name = strip_meansparse_tag(classifier_name)
     cache_base = (
         f"{cache_classifier_name.replace('/', '_')}_rp{rp_dim}_seed{seed}"
-        f"{noise_tag}{hardneg_tag}"
+        f"{noise_tag}{hardneg_tag}{stability_tag}"
     )
     cache_name = (
         f"{cache_base}_ranpac_v{RANPAC_CACHE_VERSION}.pt"
@@ -671,6 +741,8 @@ def apply_ranpac_head(
             soft_threshold_alpha=soft_threshold_alpha,
             soft_threshold_beta=soft_threshold_beta,
             soft_threshold_stat_eps=soft_threshold_stat_eps,
+            stability_ridge_gamma=stability_ridge_gamma,
+            stability_ridge_stat_eps=stability_ridge_stat_eps,
         )
 
     if state["layer_name"] != layer_name:

@@ -33,6 +33,10 @@ from tqdm.auto import tqdm
 
 from classifiers.hira import apply_hira_adaptation, build_hira_variant_name
 from classifiers.ranpac import apply_ranpac_head
+from classifiers.stability_ridge import (
+    DEFAULT_STABILITY_RIDGE_STAT_EPS,
+    build_stability_ridge_tag,
+)
 from dataset import get_dataset as instantpure_get_dataset
 
 try:
@@ -94,6 +98,14 @@ def build_meansparse_name_tag(args, separator="-"):
     if args.soft_threshold_stat_eps != 1e-6:
         tag = f"{tag}{separator}mseps{_format_variant_value(args.soft_threshold_stat_eps)}"
     return tag
+
+
+def build_stability_ridge_name_tag(args, separator="-"):
+    return build_stability_ridge_tag(
+        gamma=args.stability_ridge_gamma,
+        stat_eps=args.stability_ridge_stat_eps,
+        separator=separator,
+    )
 
 
 def parse_args():
@@ -184,6 +196,8 @@ def parse_args():
     parser.add_argument("--soft-threshold-alpha", "--soft_threshold_alpha", type=float, default=0.0, help="Width of the smooth mean-centered threshold in units of feature std; 0 disables it.")
     parser.add_argument("--soft-threshold-beta", "--soft_threshold_beta", type=float, default=8.0, help="Sharpness of the smooth mean-centered threshold.")
     parser.add_argument("--soft-threshold-stat-eps", "--soft_threshold_stat_eps", type=float, default=1e-6, help="Minimum feature std used by the smooth mean-centered threshold.")
+    parser.add_argument("--stability-ridge-gamma", "--stability_ridge_gamma", type=float, default=0.0, help="Strength of the stability-aware diagonal ridge prior; 0 disables it.")
+    parser.add_argument("--stability-ridge-stat-eps", "--stability_ridge_stat_eps", type=float, default=DEFAULT_STABILITY_RIDGE_STAT_EPS, help="Minimum projected-feature std used by the stability-aware ridge prior.")
     parser.add_argument(
         "--use-ranpac",
         "--use_ranpac",
@@ -819,6 +833,8 @@ def main():
                         soft_threshold_alpha=args.soft_threshold_alpha,
                         soft_threshold_beta=args.soft_threshold_beta,
                         soft_threshold_stat_eps=args.soft_threshold_stat_eps,
+                        stability_ridge_gamma=args.stability_ridge_gamma,
+                        stability_ridge_stat_eps=args.stability_ridge_stat_eps,
                     ).to(device).eval()
                     classifier_name = build_hira_variant_name(
                         classifier_name,
@@ -835,6 +851,8 @@ def main():
                         soft_threshold_alpha=args.soft_threshold_alpha,
                         soft_threshold_beta=args.soft_threshold_beta,
                         soft_threshold_stat_eps=args.soft_threshold_stat_eps,
+                        stability_ridge_gamma=args.stability_ridge_gamma,
+                        stability_ridge_stat_eps=args.stability_ridge_stat_eps,
                     )
                 if variant_cfg["use_ranpac"]:
                     reference_logits, reference_targets = _collect_logits(
@@ -861,6 +879,8 @@ def main():
                         soft_threshold_alpha=args.soft_threshold_alpha,
                         soft_threshold_beta=args.soft_threshold_beta,
                         soft_threshold_stat_eps=args.soft_threshold_stat_eps,
+                        stability_ridge_gamma=args.stability_ridge_gamma,
+                        stability_ridge_stat_eps=args.stability_ridge_stat_eps,
                         ranpac_lambda=args.ranpac_lambda,
                         ranpac_temp=args.ranpac_temp,
                         hardneg_topk=args.ranpac_hardneg_topk,
@@ -883,6 +903,8 @@ def main():
                     )
                 if (variant_cfg["use_hira"] or variant_cfg["use_ranpac"]) and args.soft_threshold_alpha > 0:
                     benchmark_model_name = f"{benchmark_model_name}{build_meansparse_name_tag(args)}"
+                if variant_cfg["use_hira"] or variant_cfg["use_ranpac"]:
+                    benchmark_model_name = f"{benchmark_model_name}{build_stability_ridge_name_tag(args)}"
 
                 metrics = evaluate_variant(
                     model,

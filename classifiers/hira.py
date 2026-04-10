@@ -19,10 +19,17 @@ from classifiers.mean_sparse import (
     strip_meansparse_tag,
 )
 from classifiers.ranpac import RIDGE_CANDIDATES
+from classifiers.stability_ridge import (
+    DEFAULT_STABILITY_RIDGE_STAT_EPS,
+    build_stability_ridge_tag,
+    compute_stability_ridge_prior,
+    is_stability_ridge_enabled,
+    solve_ridge_system,
+)
 from dataset import get_dataset
 
 
-HIRA_CACHE_VERSION = 30
+HIRA_CACHE_VERSION = 31
 
 
 class HiRAHalfPrecisionWrapper(nn.Module):
@@ -297,6 +304,8 @@ def build_hira_variant_name(
     soft_threshold_alpha=0.0,
     soft_threshold_beta=8.0,
     soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+    stability_ridge_gamma=0.0,
+    stability_ridge_stat_eps=DEFAULT_STABILITY_RIDGE_STAT_EPS,
 ):
     del epochs, lr, weight_decay
 
@@ -313,6 +322,11 @@ def build_hira_variant_name(
         stat_eps=soft_threshold_stat_eps,
         separator="-",
     )
+    stability_tag = build_stability_ridge_tag(
+        gamma=stability_ridge_gamma,
+        stat_eps=stability_ridge_stat_eps,
+        separator="-",
+    )
     return (
         f"{classifier_name}-hira-v{HIRA_CACHE_VERSION}-post-fc2-closedform-gelu"
         f"{block_tag}"
@@ -321,6 +335,7 @@ def build_hira_variant_name(
         f"-seed{seed}"
         f"{noise_tag}"
         f"{meansparse_tag}"
+        f"{stability_tag}"
     )
 
 
@@ -339,6 +354,8 @@ def _build_cache_name(
     soft_threshold_alpha,
     soft_threshold_beta,
     soft_threshold_stat_eps,
+    stability_ridge_gamma,
+    stability_ridge_stat_eps,
 ):
     del soft_threshold_alpha, soft_threshold_beta, soft_threshold_stat_eps
     return build_hira_variant_name(
@@ -356,6 +373,8 @@ def _build_cache_name(
         soft_threshold_alpha=0.0,
         soft_threshold_beta=8.0,
         soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+        stability_ridge_gamma=stability_ridge_gamma,
+        stability_ridge_stat_eps=stability_ridge_stat_eps,
     ).replace("/", "_") + ".pt"
 
 
@@ -404,7 +423,13 @@ def _build_train_loaders(dataset_root, batch_size, num_workers, seed, max_train_
     )
 
 
-def _init_hira_statistics(model, mlp_module_names, stats_device, collect_feature_stats=False):
+def _init_hira_statistics(
+    model,
+    mlp_module_names,
+    stats_device,
+    collect_feature_stats=False,
+    collect_projected_stability_stats=False,
+):
     statistics = {}
     for module_name in mlp_module_names:
         wrapper = _get_module_by_name(model, module_name)
@@ -420,6 +445,11 @@ def _init_hira_statistics(model, mlp_module_names, stats_device, collect_feature
             entry["feature_sum"] = torch.zeros(out_dim, dtype=torch.float64, device=stats_device)
             entry["feature_sum_sq"] = torch.zeros(out_dim, dtype=torch.float64, device=stats_device)
             entry["feature_sample_count"] = 0
+        if collect_projected_stability_stats:
+            entry["projected_sum"] = torch.zeros(rp_dim, dtype=torch.float64, device=stats_device)
+            entry["projected_sum_sq"] = torch.zeros(rp_dim, dtype=torch.float64, device=stats_device)
+            entry["projected_abs_sum"] = torch.zeros(rp_dim, dtype=torch.float64, device=stats_device)
+            entry["projected_sample_count"] = 0.0
         statistics[module_name] = entry
     return statistics
 
@@ -440,12 +470,18 @@ def _accumulate_projected_statistics(
     source_tokens,
     target_tokens,
     weight,
+    collect_projected_stability_stats=False,
 ):
     if weight <= 0:
         return
 
     projected_inputs = source_tokens.to(dtype=b_rand.dtype)
     projected = F.gelu(projected_inputs @ b_rand).float()
+    if collect_projected_stability_stats:
+        entry["projected_sum"] += weight * projected.sum(dim=0, dtype=torch.float64)
+        entry["projected_sum_sq"] += weight * projected.square().sum(dim=0, dtype=torch.float64)
+        entry["projected_abs_sum"] += weight * projected.abs().sum(dim=0, dtype=torch.float64)
+        entry["projected_sample_count"] += weight * projected.size(0)
     entry["g_matrix"] += weight * (projected.t() @ projected)
     entry["q_matrix"] += weight * (projected.t() @ target_tokens)
     entry["target_norm"] += weight * target_tokens.square().sum()
@@ -461,6 +497,7 @@ def _select_ridge_by_regression_loss(
     out_features,
     val_sample_count,
     device,
+    diagonal_prior=None,
 ):
     if val_sample_count == 0:
         return RIDGE_CANDIDATES[0], None
@@ -469,15 +506,13 @@ def _select_ridge_by_regression_loss(
     q_train = q_train.to(device)
     g_val = g_val.to(device)
     q_val = q_val.to(device)
-    eye = torch.eye(g_train.size(0), device=device, dtype=g_train.dtype)
-
     best_ridge = RIDGE_CANDIDATES[0]
     best_loss = None
     denominator = max(val_sample_count * out_features, 1)
 
     with torch.no_grad():
         for ridge in RIDGE_CANDIDATES:
-            weight = torch.linalg.solve(g_train + ridge * eye, q_train).t()
+            weight = solve_ridge_system(g_train, q_train, ridge, diagonal_prior=diagonal_prior).t()
             quadratic = torch.trace(weight @ g_val @ weight.t())
             cross_term = torch.trace(weight @ q_val)
             loss = (quadratic - 2.0 * cross_term + val_target_norm) / denominator
@@ -500,6 +535,7 @@ def _accumulate_hira_statistics(
     adapt_noise_num,
     adapt_alpha,
     collect_feature_stats=False,
+    collect_projected_stability_stats=False,
 ):
     stats_device = device if device.type == "cuda" else torch.device("cpu")
     statistics = _init_hira_statistics(
@@ -507,6 +543,7 @@ def _accumulate_hira_statistics(
         mlp_module_names,
         stats_device,
         collect_feature_stats=collect_feature_stats,
+        collect_projected_stability_stats=collect_projected_stability_stats,
     )
     b_rand_by_module = {
         module_name: _get_module_by_name(model, module_name).mlp_adapter.b_rand.to(
@@ -559,6 +596,7 @@ def _accumulate_hira_statistics(
                                 clean_outputs,
                                 clean_outputs,
                                 weight=1.0,
+                                collect_projected_stability_stats=collect_projected_stability_stats,
                             )
 
                 if use_noisy_adaptation:
@@ -578,6 +616,7 @@ def _accumulate_hira_statistics(
                                 noisy_outputs,
                                 noisy_outputs,
                                 weight=noisy_sample_weight,
+                                collect_projected_stability_stats=collect_projected_stability_stats,
                             )
     finally:
         for handle in handles:
@@ -606,6 +645,8 @@ def _fit_hira_weights_closed_form(
     adapt_noise_eps,
     adapt_noise_num,
     adapt_alpha,
+    stability_ridge_gamma,
+    stability_ridge_stat_eps,
 ):
     # Keep ridge fitting on the original continuous MLP outputs and only
     # collect clean feature stats for inference-time thresholding in the same pass.
@@ -620,6 +661,7 @@ def _fit_hira_weights_closed_form(
         adapt_noise_num=adapt_noise_num,
         adapt_alpha=adapt_alpha,
         collect_feature_stats=True,
+        collect_projected_stability_stats=is_stability_ridge_enabled(stability_ridge_gamma),
     )
     val_stats = _accumulate_hira_statistics(
         model,
@@ -639,6 +681,14 @@ def _fit_hira_weights_closed_form(
         train_entry = train_stats[module_name]
         val_entry = val_stats[module_name]
         out_features = wrapper.mlp_adapter.a_weight.size(0)
+        diagonal_prior = compute_stability_ridge_prior(
+            train_entry.get("projected_sum"),
+            train_entry.get("projected_sum_sq"),
+            train_entry.get("projected_abs_sum"),
+            train_entry.get("projected_sample_count", 0.0),
+            stability_ridge_gamma,
+            stability_ridge_stat_eps,
+        )
 
         with torch.no_grad():
             wrapper.mlp_adapter.soft_threshold_mean.copy_(train_entry["soft_threshold_mean"])
@@ -653,12 +703,13 @@ def _fit_hira_weights_closed_form(
             out_features,
             val_entry["sample_count"],
             device,
+            diagonal_prior=diagonal_prior,
         )
 
         g_full = (train_entry["g_matrix"] + val_entry["g_matrix"]).to(device)
         q_full = (train_entry["q_matrix"] + val_entry["q_matrix"]).to(device)
-        eye = torch.eye(g_full.size(0), device=device, dtype=g_full.dtype)
-        weight = torch.linalg.solve(g_full + ridge * eye, q_full).t().to(dtype=wrapper.mlp_adapter.a_weight.dtype).cpu()
+        weight = solve_ridge_system(g_full, q_full, ridge, diagonal_prior=diagonal_prior).t()
+        weight = weight.to(dtype=wrapper.mlp_adapter.a_weight.dtype).cpu()
         with torch.no_grad():
             wrapper.mlp_adapter.a_weight.copy_(weight)
 
@@ -699,6 +750,8 @@ def apply_hira_adaptation(
     soft_threshold_alpha=0.0,
     soft_threshold_beta=8.0,
     soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+    stability_ridge_gamma=0.0,
+    stability_ridge_stat_eps=DEFAULT_STABILITY_RIDGE_STAT_EPS,
 ):
     if adapt_noise_eps < 0:
         raise ValueError("HiRA adapt_noise_eps must be non-negative.")
@@ -712,6 +765,10 @@ def apply_hira_adaptation(
         raise ValueError("HiRA soft_threshold_beta must be positive when soft thresholding is enabled.")
     if soft_threshold_stat_eps <= 0:
         raise ValueError("HiRA soft_threshold_stat_eps must be positive.")
+    if stability_ridge_gamma < 0:
+        raise ValueError("HiRA stability_ridge_gamma must be non-negative.")
+    if stability_ridge_stat_eps <= 0:
+        raise ValueError("HiRA stability_ridge_stat_eps must be positive.")
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -748,6 +805,8 @@ def apply_hira_adaptation(
             soft_threshold_alpha=soft_threshold_alpha,
             soft_threshold_beta=soft_threshold_beta,
             soft_threshold_stat_eps=soft_threshold_stat_eps,
+            stability_ridge_gamma=stability_ridge_gamma,
+            stability_ridge_stat_eps=stability_ridge_stat_eps,
         ),
     )
 
@@ -776,6 +835,8 @@ def apply_hira_adaptation(
         adapt_noise_eps=adapt_noise_eps,
         adapt_noise_num=adapt_noise_num,
         adapt_alpha=adapt_alpha,
+        stability_ridge_gamma=stability_ridge_gamma,
+        stability_ridge_stat_eps=stability_ridge_stat_eps,
     )
 
     state = {
@@ -792,6 +853,10 @@ def apply_hira_adaptation(
         "soft_threshold_alpha": soft_threshold_alpha,
         "soft_threshold_beta": soft_threshold_beta,
         "soft_threshold_stat_eps": soft_threshold_stat_eps,
+        "stability_ridge_enabled": is_stability_ridge_enabled(stability_ridge_gamma),
+        "stability_ridge_gamma": stability_ridge_gamma,
+        "stability_ridge_stat_eps": stability_ridge_stat_eps,
+        "stability_ridge_source": "train_projected_feature_snr",
         "mlp_module_names": mlp_module_names,
         "fit_method": "ridge_regression",
         "ridge_candidates": RIDGE_CANDIDATES,

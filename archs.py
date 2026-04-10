@@ -7,6 +7,7 @@ import torchvision
 from classifiers.hira import apply_hira_adaptation, build_hira_variant_name
 from classifiers.mean_sparse import DEFAULT_MEANSPARSE_STAT_EPS
 from classifiers.ranpac import apply_ranpac_head
+from classifiers.stability_ridge import DEFAULT_STABILITY_RIDGE_STAT_EPS
 
 
 IMAGENET_MODEL = (
@@ -166,6 +167,8 @@ def get_archs(
     soft_threshold_alpha=0.0,
     soft_threshold_beta=8.0,
     soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+    stability_ridge_gamma=0.0,
+    stability_ridge_stat_eps=DEFAULT_STABILITY_RIDGE_STAT_EPS,
     use_ranpac=False,
     ranpac_rp_dim=5000,
     ranpac_batch_size=256,
@@ -213,6 +216,8 @@ def get_archs(
             soft_threshold_alpha=soft_threshold_alpha,
             soft_threshold_beta=soft_threshold_beta,
             soft_threshold_stat_eps=soft_threshold_stat_eps,
+            stability_ridge_gamma=stability_ridge_gamma,
+            stability_ridge_stat_eps=stability_ridge_stat_eps,
         )
         classifier_name = build_hira_variant_name(
             classifier_name,
@@ -229,6 +234,8 @@ def get_archs(
             soft_threshold_alpha=soft_threshold_alpha,
             soft_threshold_beta=soft_threshold_beta,
             soft_threshold_stat_eps=soft_threshold_stat_eps,
+            stability_ridge_gamma=stability_ridge_gamma,
+            stability_ridge_stat_eps=stability_ridge_stat_eps,
         )
 
     if use_ranpac:
@@ -249,6 +256,8 @@ def get_archs(
             soft_threshold_alpha=soft_threshold_alpha,
             soft_threshold_beta=soft_threshold_beta,
             soft_threshold_stat_eps=soft_threshold_stat_eps,
+            stability_ridge_gamma=stability_ridge_gamma,
+            stability_ridge_stat_eps=stability_ridge_stat_eps,
             ranpac_lambda=ranpac_lambda,
             ranpac_temp=ranpac_temp,
             hardneg_topk=ranpac_hardneg_topk,
