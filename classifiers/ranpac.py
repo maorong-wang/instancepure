@@ -18,7 +18,7 @@ from classifiers.mean_sparse import (
 )
 
 RIDGE_CANDIDATES = [10.0 ** power for power in range(-8, 14)]
-RANPAC_CACHE_VERSION = 14
+RANPAC_CACHE_VERSION = 15
 
 
 class RanPACLinear(nn.Module):
@@ -49,16 +49,15 @@ class RanPACLinear(nn.Module):
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
-        projected = x @ self.w_rand
-        projected = apply_mean_centered_soft_threshold(
-            projected,
+        x = apply_mean_centered_soft_threshold(
+            x,
             self.soft_threshold_mean,
             self.soft_threshold_std,
             alpha=self.soft_threshold_alpha,
             beta=self.soft_threshold_beta,
             stat_eps=self.soft_threshold_stat_eps,
         )
-        projected = F.relu(projected)
+        projected = F.gelu(x @ self.w_rand)
         return projected @ self.weight.t()
 
 
@@ -236,7 +235,7 @@ def _accumulate_statistics(
                         feature_buffer.clear()
                         noisy_logits = model(noisy_inputs)
                         noisy_features = feature_buffer.pop().view(inputs.size(0), -1).cpu()
-                        noisy_projected = F.relu(noisy_features @ w_rand)
+                        noisy_projected = F.gelu(noisy_features @ w_rand)
                         noisy_targets = _build_supervised_targets(
                             noisy_logits,
                             targets,
@@ -254,7 +253,7 @@ def _accumulate_statistics(
                     feature_buffer.clear()
                     logits = model(inputs)
                     features = feature_buffer.pop().view(inputs.size(0), -1).cpu()
-                    projected = F.relu(features @ w_rand)
+                    projected = F.gelu(features @ w_rand)
                     supervised_targets = _build_supervised_targets(
                         logits,
                         targets,
@@ -346,17 +345,16 @@ def _collect_train_statistics(
                 feature_buffer.clear()
                 clean_logits = model(inputs)
                 clean_features = feature_buffer.pop().view(inputs.size(0), -1).float().cpu()
-                clean_projected_raw = clean_features @ w_rand
                 logit_sum += clean_logits.float().sum().item()
                 logit_count += clean_logits.numel()
 
                 if collect_feature_stats:
                     if feature_sum is None:
-                        feature_sum = torch.zeros(clean_projected_raw.size(1), dtype=torch.float64)
-                        feature_sum_sq = torch.zeros(clean_projected_raw.size(1), dtype=torch.float64)
-                    feature_sum += clean_projected_raw.sum(dim=0, dtype=torch.float64)
-                    feature_sum_sq += clean_projected_raw.square().sum(dim=0, dtype=torch.float64)
-                    feature_sample_count += clean_projected_raw.size(0)
+                        feature_sum = torch.zeros(clean_features.size(1), dtype=torch.float64)
+                        feature_sum_sq = torch.zeros(clean_features.size(1), dtype=torch.float64)
+                    feature_sum += clean_features.sum(dim=0, dtype=torch.float64)
+                    feature_sum_sq += clean_features.square().sum(dim=0, dtype=torch.float64)
+                    feature_sample_count += clean_features.size(0)
 
                 if not accumulate_ridge_stats:
                     continue
@@ -371,7 +369,7 @@ def _collect_train_statistics(
                         feature_buffer.clear()
                         noisy_logits = model(noisy_inputs)
                         noisy_features = feature_buffer.pop().view(inputs.size(0), -1).cpu()
-                        noisy_projected = F.relu(noisy_features @ w_rand)
+                        noisy_projected = F.gelu(noisy_features @ w_rand)
                         noisy_targets = _build_supervised_targets(
                             noisy_logits,
                             targets,
@@ -385,7 +383,7 @@ def _collect_train_statistics(
                         target_norm += noisy_sample_weight * target_norm_value
                         sample_count += noisy_sample_weight * noisy_targets.size(0)
                 else:
-                    projected = F.relu(clean_projected_raw)
+                    projected = F.gelu(clean_features @ w_rand)
                     supervised_targets = _build_supervised_targets(
                         clean_logits,
                         targets,
@@ -467,6 +465,8 @@ def _fit_ranpac_state(
 
     model = model.eval().to(device)
     print(f"Fitting RanPAC head for {cache_path}...")
+    # Keep ridge fitting on the original continuous backbone features and only
+    # collect clean feature stats for inference-time thresholding in the same pass.
     train_stats = _collect_train_statistics(
         model,
         linear_layer,
@@ -550,7 +550,7 @@ def _fit_ranpac_state(
         "baseline_logit_mean_source": "train_clean_global_scalar",
         "baseline_logit_mean": baseline_logit_mean,
         "soft_threshold_enabled": is_meansparse_enabled(soft_threshold_alpha),
-        "soft_threshold_mean_source": "train_clean_random_projection_channel",
+        "soft_threshold_mean_source": "train_clean_feature_channel",
         "soft_threshold_mean": soft_threshold_mean,
         "soft_threshold_std": soft_threshold_std,
         "soft_threshold_stats_collected": True,
