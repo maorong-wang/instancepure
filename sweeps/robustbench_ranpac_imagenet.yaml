@@ -1,6 +1,6 @@
 program: eval_robustbench_ranpac.py
 method: grid
-project: robustbench-ranpac-hira-rc-rp_normalization_ridge_prior
+project: robustbench-ranpac-hira-rc-sweep
 name: robustbench-ranpac-hira-imagenet
 metric:
   name: robust_acc
@@ -19,7 +19,7 @@ parameters:
       - Liu2023Comprehensive_Swin-L
       - Xu2024MIMIR_Swin-L
   use_hira:
-    values: [false]
+    values: [true]
   use_ranpac:
     values: [true]
   attack_method:
@@ -41,7 +41,7 @@ parameters:
   autoattack_version:
     values: [standard]
   hira_expansion_dim:
-    values: [32768]
+    values: [8192]
   hira_num_blocks:
     values: [4]
   hira_batch_size:
@@ -71,23 +71,23 @@ parameters:
   adapt_alpha:
     value: 1
   soft_threshold_alpha:
-    values: [0.0]
+    values: [0.3]
   soft_threshold_beta:
-    values: [4.0]
+    values: [8.0]
   soft_threshold_stat_eps:
     value: 1.0e-6
   soft_threshold_mode:
     values: ["near_mean", "away_from_mean"]
   stability_ridge_gamma:
-    values: [1.0]
+    values: [0.0]
   stability_ridge_stat_eps:
     value: 1.0e-6
   ranpac_rp_dim:
     values: [10000]
   ranpac_lambda:
-    values: [1]
+    values: [.5]
   ranpac_temp:
-    value: 0.10
+    value: 1
   ranpac_hardneg_topk:
     value: 0
   ranpac_hardneg_gamma:
