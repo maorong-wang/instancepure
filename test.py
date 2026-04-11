@@ -13,11 +13,6 @@ import torchvision
 from tqdm.auto import tqdm
 import random
 from archs import get_archs, IMAGENET_MODEL
-from classifiers.ranpac import (
-    DEFAULT_RANPAC_FEATURE_STAT_EPS,
-    RANPAC_FEATURE_MODES,
-    build_ranpac_feature_mode_tag,
-)
 from classifiers.stability_ridge import (
     DEFAULT_STABILITY_RIDGE_STAT_EPS,
     build_stability_ridge_tag,
@@ -68,7 +63,7 @@ def parse_args():
         type=str,
         help=f"classification model. Available: {', '.join(IMAGENET_MODEL)}",
     )
-    parser.add_argument("--use_hira_adapter", type=str2bool, default=False, help="attach HiRA after the MLP output of the last N transformer blocks for ViT-family backbones")
+    parser.add_argument("--use_hira_adapter", type=str2bool, default=False, help="attach HiRA before the MLP of the last N transformer blocks for ViT-family backbones")
     parser.add_argument("--hira_expansion_dim", type=int, default=4096, help="hidden expansion dimension for HiRA adapters")
     parser.add_argument("--hira_num_blocks", type=int, default=2, help="number of final transformer MLP blocks that receive HiRA adapters")
     parser.add_argument("--hira_batch_size", type=int, default=32, help="batch size used to fit closed-form HiRA weights")
@@ -84,9 +79,9 @@ def parse_args():
     parser.add_argument("--adapt_noise_eps", type=float, default=0.0, help="Linf noise radius used while fitting HiRA and RanPAC adaptation statistics")
     parser.add_argument("--adapt_noise_num", type=int, default=0, help="number of noisy samples per training image used while fitting HiRA and RanPAC")
     parser.add_argument("--adapt_alpha", type=float, default=1.0, help="total weight assigned to noisy adaptation statistics relative to clean statistics")
-    parser.add_argument("--soft_threshold_alpha", type=float, default=0.0, help="width of the smooth mean-centered threshold in units of feature std; 0 disables it")
-    parser.add_argument("--soft_threshold_beta", type=float, default=8.0, help="sharpness of the smooth mean-centered threshold")
-    parser.add_argument("--soft_threshold_stat_eps", type=float, default=1e-6, help="minimum feature std used by the smooth mean-centered threshold")
+    parser.add_argument("--soft_threshold_alpha", type=float, default=0.0, help="HiRA-only width of the smooth mean-centered threshold in units of hidden-feature std; 0 disables it")
+    parser.add_argument("--soft_threshold_beta", type=float, default=8.0, help="HiRA-only sharpness of the smooth mean-centered threshold")
+    parser.add_argument("--soft_threshold_stat_eps", type=float, default=1e-6, help="HiRA-only minimum hidden-feature std used by the smooth mean-centered threshold")
     parser.add_argument("--stability_ridge_gamma", type=float, default=0.0, help="strength of the stability-aware diagonal ridge prior; 0 disables it")
     parser.add_argument("--stability_ridge_stat_eps", type=float, default=DEFAULT_STABILITY_RIDGE_STAT_EPS, help="minimum projected-feature std used by the stability-aware ridge prior")
     parser.add_argument("--attack_method", default="Linf_pgd", type=str, help="attack model")
@@ -96,8 +91,6 @@ def parse_args():
     parser.add_argument("--ranpac_batch_size", type=int, default=256, help="batch size used to fit the RanPAC head")
     parser.add_argument("--ranpac_num_workers", type=int, default=8, help="number of workers used to fit the RanPAC head")
     parser.add_argument("--ranpac_seed", type=int, default=0, help="seed used to build the RanPAC random projection")
-    parser.add_argument("--ranpac_feature_mode", type=str, choices=RANPAC_FEATURE_MODES, default="gelu", help="projected feature transform used by the RanPAC ridge head")
-    parser.add_argument("--ranpac_feature_stat_eps", type=float, default=DEFAULT_RANPAC_FEATURE_STAT_EPS, help="minimum projected-feature std used by non-default RanPAC feature transforms")
     parser.add_argument("--ranpac_lambda", type=float, default=1.0, help="convex mixing weight between the original classifier head and the temperature-scaled RanPAC head")
     parser.add_argument("--ranpac_temp", type=float, default=1.0, help="temperature applied to the RanPAC logits before ensembling")
     parser.add_argument("--ranpac_hardneg_topk", type=int, default=9, help="number of top confusing non-ground-truth classes to suppress in the RanPAC regression targets")
@@ -175,14 +168,6 @@ def build_stability_ridge_variant_tag(args):
     return build_stability_ridge_tag(
         gamma=args.stability_ridge_gamma,
         stat_eps=args.stability_ridge_stat_eps,
-        separator="_",
-    )
-
-
-def build_ranpac_feature_variant_tag(args):
-    return build_ranpac_feature_mode_tag(
-        feature_mode=args.ranpac_feature_mode,
-        feature_stat_eps=args.ranpac_feature_stat_eps,
         separator="_",
     )
 
@@ -451,7 +436,6 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
     classifier_variant = classifier
     adapt_noise_tag = build_adapt_noise_tag(args)
     meansparse_tag = build_meansparse_tag(args)
-    ranpac_feature_tag = build_ranpac_feature_variant_tag(args)
     stability_ridge_tag = build_stability_ridge_variant_tag(args)
     if args.use_hira_adapter:
         classifier_variant = f"{classifier_variant}_hira"
@@ -470,10 +454,8 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
             )
     if adapt_noise_tag and (args.use_hira_adapter or args.use_ranpac_head):
         classifier_variant = f"{classifier_variant}{adapt_noise_tag}"
-    if meansparse_tag and (args.use_hira_adapter or args.use_ranpac_head):
+    if meansparse_tag and args.use_hira_adapter:
         classifier_variant = f"{classifier_variant}{meansparse_tag}"
-    if ranpac_feature_tag and args.use_ranpac_head:
-        classifier_variant = f"{classifier_variant}{ranpac_feature_tag}"
     if stability_ridge_tag and (args.use_hira_adapter or args.use_ranpac_head):
         classifier_variant = f"{classifier_variant}{stability_ridge_tag}"
     lora_dir = args.lora_input_dir or "no_lora"
@@ -522,8 +504,6 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         ranpac_num_workers=args.ranpac_num_workers,
         ranpac_seed=args.ranpac_seed,
         ranpac_selection_method=args.ranpac_selection_method,
-        ranpac_feature_mode=args.ranpac_feature_mode,
-        ranpac_feature_stat_eps=args.ranpac_feature_stat_eps,
         ranpac_lambda=args.ranpac_lambda,
         ranpac_temp=args.ranpac_temp,
         ranpac_hardneg_topk=args.ranpac_hardneg_topk,
@@ -656,8 +636,6 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         "soft_threshold_alpha": args.soft_threshold_alpha,
         "soft_threshold_beta": args.soft_threshold_beta,
         "soft_threshold_stat_eps": args.soft_threshold_stat_eps,
-        "ranpac_feature_mode": args.ranpac_feature_mode,
-        "ranpac_feature_stat_eps": args.ranpac_feature_stat_eps,
         "ranpac_lambda": args.ranpac_lambda,
         "ranpac_temp": args.ranpac_temp,
         "ranpac_baseline_bias_centered": args.use_ranpac_head,

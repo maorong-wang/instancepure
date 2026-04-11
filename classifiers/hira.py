@@ -29,7 +29,7 @@ from classifiers.stability_ridge import (
 from dataset import get_dataset
 
 
-HIRA_CACHE_VERSION = 31
+HIRA_CACHE_VERSION = 32
 
 
 class HiRAHalfPrecisionWrapper(nn.Module):
@@ -59,8 +59,8 @@ class HiRAAdapter(nn.Module):
         super().__init__()
         self.register_buffer("b_rand", torch.randn(in_features, expansion_dim, dtype=torch.float16))
         self.a_weight = nn.Parameter(torch.empty(out_features, expansion_dim, dtype=torch.float16))
-        self.register_buffer("soft_threshold_mean", torch.zeros(in_features, dtype=torch.float32))
-        self.register_buffer("soft_threshold_std", torch.ones(in_features, dtype=torch.float32))
+        self.register_buffer("soft_threshold_mean", torch.zeros(expansion_dim, dtype=torch.float32))
+        self.register_buffer("soft_threshold_std", torch.ones(expansion_dim, dtype=torch.float32))
         self.soft_threshold_alpha = float(soft_threshold_alpha)
         self.soft_threshold_beta = float(soft_threshold_beta)
         self.soft_threshold_stat_eps = float(soft_threshold_stat_eps)
@@ -83,16 +83,8 @@ class HiRAAdapter(nn.Module):
         self._a_weight_fp32 = self.a_weight.detach().float().to(device=device)
         self._fp32_cache_device = cache_device
 
-    def project(self, x):
+    def project_hidden(self, x, apply_soft_threshold):
         token_features = x.reshape(-1, x.shape[-1])
-        token_features = apply_mean_centered_soft_threshold(
-            token_features,
-            self.soft_threshold_mean,
-            self.soft_threshold_std,
-            alpha=self.soft_threshold_alpha,
-            beta=self.soft_threshold_beta,
-            stat_eps=self.soft_threshold_stat_eps,
-        )
         if self.force_fp32:
             token_features = token_features.float()
             if token_features.device.type == "cuda":
@@ -106,11 +98,21 @@ class HiRAAdapter(nn.Module):
         else:
             token_features = token_features.float()
             projected = token_features @ self.b_rand.float()
-        return F.gelu(projected)
+        projected = F.gelu(projected)
+        if apply_soft_threshold:
+            projected = apply_mean_centered_soft_threshold(
+                projected,
+                self.soft_threshold_mean,
+                self.soft_threshold_std,
+                alpha=self.soft_threshold_alpha,
+                beta=self.soft_threshold_beta,
+                stat_eps=self.soft_threshold_stat_eps,
+            )
+        return projected
 
     def forward(self, x):
         token_shape = x.shape[:-1]
-        projected = self.project(x)
+        projected = self.project_hidden(x, apply_soft_threshold=True)
         if projected.device.type == "cuda" and not self.force_fp32:
             output = projected @ self.a_weight.t()
         else:
@@ -133,30 +135,18 @@ class HiRAMlpWrapper(nn.Module):
     ):
         super().__init__()
         self.base_mlp = base_mlp
-        mlp_output_dim = _infer_mlp_output_dim(base_mlp)
+        mlp_input_dim = _infer_mlp_input_dim(base_mlp)
         self.mlp_adapter = HiRAAdapter(
-            mlp_output_dim,
-            mlp_output_dim,
+            mlp_input_dim,
+            mlp_input_dim,
             expansion_dim,
             soft_threshold_alpha=soft_threshold_alpha,
             soft_threshold_beta=soft_threshold_beta,
             soft_threshold_stat_eps=soft_threshold_stat_eps,
         )
 
-    def post_fc2(self, x):
-        x = self.base_mlp.fc1(x)
-        if hasattr(self.base_mlp, "act"):
-            x = self.base_mlp.act(x)
-        if hasattr(self.base_mlp, "drop1"):
-            x = self.base_mlp.drop1(x)
-        elif hasattr(self.base_mlp, "drop"):
-            x = self.base_mlp.drop(x)
-        if hasattr(self.base_mlp, "norm"):
-            x = self.base_mlp.norm(x)
-        return self.base_mlp.fc2(x)
-
     def forward(self, x, *args, **kwargs):
-        return self.mlp_adapter(self.post_fc2(x))
+        return self.base_mlp(self.mlp_adapter(x), *args, **kwargs)
 
 
 def _get_module_by_name(model, module_name):
@@ -182,15 +172,15 @@ def _list_mlp_modules(model):
     ]
 
 
-def _infer_mlp_output_dim(module):
-    for attr_path in ("fc2.out_features", "fc2.out_channels"):
+def _infer_mlp_input_dim(module):
+    for attr_path in ("fc1.in_features", "fc1.in_channels"):
         try:
             candidate = _get_module_by_name(module, attr_path)
         except AttributeError:
             continue
         if isinstance(candidate, int):
             return candidate
-    raise ValueError("Unable to infer MLP output dimension for HiRA attachment.")
+    raise ValueError("Unable to infer MLP input dimension for HiRA attachment.")
 
 
 def _resolve_target_mlp_modules(model, num_adapter_blocks):
@@ -328,7 +318,7 @@ def build_hira_variant_name(
         separator="-",
     )
     return (
-        f"{classifier_name}-hira-v{HIRA_CACHE_VERSION}-post-fc2-closedform-gelu"
+        f"{classifier_name}-hira-v{HIRA_CACHE_VERSION}-pre-mlp-closedform-gelu"
         f"{block_tag}"
         f"-exp{expansion_dim}"
         f"-ns{sample_tag}"
@@ -442,8 +432,8 @@ def _init_hira_statistics(
             "sample_count": 0.0,
         }
         if collect_feature_stats:
-            entry["feature_sum"] = torch.zeros(out_dim, dtype=torch.float64, device=stats_device)
-            entry["feature_sum_sq"] = torch.zeros(out_dim, dtype=torch.float64, device=stats_device)
+            entry["feature_sum"] = torch.zeros(rp_dim, dtype=torch.float64, device=stats_device)
+            entry["feature_sum_sq"] = torch.zeros(rp_dim, dtype=torch.float64, device=stats_device)
             entry["feature_sample_count"] = 0
         if collect_projected_stability_stats:
             entry["projected_sum"] = torch.zeros(rp_dim, dtype=torch.float64, device=stats_device)
@@ -464,10 +454,14 @@ def _accumulate_feature_statistics(entry, source_tokens):
     entry["feature_sample_count"] += source_tokens.size(0)
 
 
+def _project_hira_tokens(source_tokens, b_rand):
+    projected_inputs = source_tokens.to(dtype=b_rand.dtype)
+    return F.gelu(projected_inputs @ b_rand).float()
+
+
 def _accumulate_projected_statistics(
     entry,
-    b_rand,
-    source_tokens,
+    projected,
     target_tokens,
     weight,
     collect_projected_stability_stats=False,
@@ -475,8 +469,6 @@ def _accumulate_projected_statistics(
     if weight <= 0:
         return
 
-    projected_inputs = source_tokens.to(dtype=b_rand.dtype)
-    projected = F.gelu(projected_inputs @ b_rand).float()
     if collect_projected_stability_stats:
         entry["projected_sum"] += weight * projected.sum(dim=0, dtype=torch.float64)
         entry["projected_sum_sq"] += weight * projected.square().sum(dim=0, dtype=torch.float64)
@@ -567,12 +559,11 @@ def _accumulate_hira_statistics(
 
     for module_name in mlp_module_names:
         teacher_module = _get_module_by_name(teacher_model, module_name)
-        teacher_fc2 = teacher_module.fc2
 
-        def hook(_, inputs, output, module_name=module_name):
-            batch_cache[module_name] = output.detach()
+        def hook(_, inputs, module_name=module_name):
+            batch_cache[module_name] = inputs[0].detach()
 
-        handles.append(teacher_fc2.register_forward_hook(hook))
+        handles.append(teacher_module.register_forward_pre_hook(hook))
 
     teacher_model = teacher_model.to(device).eval()
     try:
@@ -583,18 +574,18 @@ def _accumulate_hira_statistics(
                     batch_cache.clear()
                     _run_teacher_forward(inputs)
                     for module_name in mlp_module_names:
-                        clean_outputs = batch_cache[module_name].reshape(-1, batch_cache[module_name].shape[-1]).to(
+                        clean_inputs = batch_cache[module_name].reshape(-1, batch_cache[module_name].shape[-1]).to(
                             stats_device,
                             dtype=torch.float32,
                         )
+                        clean_projected = _project_hira_tokens(clean_inputs, b_rand_by_module[module_name])
                         if collect_feature_stats:
-                            _accumulate_feature_statistics(statistics[module_name], clean_outputs)
+                            _accumulate_feature_statistics(statistics[module_name], clean_projected)
                         if not use_noisy_adaptation:
                             _accumulate_projected_statistics(
                                 statistics[module_name],
-                                b_rand_by_module[module_name],
-                                clean_outputs,
-                                clean_outputs,
+                                clean_projected,
+                                clean_inputs,
                                 weight=1.0,
                                 collect_projected_stability_stats=collect_projected_stability_stats,
                             )
@@ -606,15 +597,21 @@ def _accumulate_hira_statistics(
                         _run_teacher_forward(noisy_inputs)
 
                         for module_name in mlp_module_names:
-                            noisy_outputs = batch_cache[module_name].reshape(-1, batch_cache[module_name].shape[-1]).to(
+                            noisy_inputs_tokens = batch_cache[module_name].reshape(
+                                -1,
+                                batch_cache[module_name].shape[-1],
+                            ).to(
                                 stats_device,
                                 dtype=torch.float32,
                             )
+                            noisy_projected = _project_hira_tokens(
+                                noisy_inputs_tokens,
+                                b_rand_by_module[module_name],
+                            )
                             _accumulate_projected_statistics(
                                 statistics[module_name],
-                                b_rand_by_module[module_name],
-                                noisy_outputs,
-                                noisy_outputs,
+                                noisy_projected,
+                                noisy_inputs_tokens,
                                 weight=noisy_sample_weight,
                                 collect_projected_stability_stats=collect_projected_stability_stats,
                             )
@@ -648,8 +645,8 @@ def _fit_hira_weights_closed_form(
     stability_ridge_gamma,
     stability_ridge_stat_eps,
 ):
-    # Keep ridge fitting on the original continuous MLP outputs and only
-    # collect clean feature stats for inference-time thresholding in the same pass.
+    # Fit the pre-MLP adapter on the original continuous MLP inputs and collect
+    # clean GELU(A(x)) statistics for inference-time sparsification.
     train_stats = _accumulate_hira_statistics(
         model,
         teacher_model,
@@ -860,10 +857,14 @@ def apply_hira_adaptation(
         "mlp_module_names": mlp_module_names,
         "fit_method": "ridge_regression",
         "ridge_candidates": RIDGE_CANDIDATES,
-        "soft_label_source": "noisy_mlp_output" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "original_mlp_output",
-        "noisy_adaptation_target": "noisy_mlp_output" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "original_mlp_output",
+        "soft_label_source": "noisy_mlp_input" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "original_mlp_input",
+        "noisy_adaptation_target": "noisy_mlp_input" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "original_mlp_input",
         "adaptation_input_source": "noisy_only" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "clean_only",
         "activation": "gelu",
+        "soft_threshold_mean_source": "train_clean_gelu_a_feature_channel",
+        "soft_threshold_stage": "after_gelu_before_b",
+        "soft_threshold_train_usage": "disabled",
+        "soft_threshold_eval_usage": "enabled" if is_meansparse_enabled(soft_threshold_alpha) else "disabled",
         "frozen_b": True,
         "ridge_fit_summary": fit_summary,
         "cache_adapter_dtype": "float16",
@@ -875,7 +876,8 @@ def apply_hira_adaptation(
         "token_projection": False,
         "mlp_projection": True,
         "mlp_residual": False,
-        "post_fc2_attachment": True,
+        "pre_mlp_attachment": True,
+        "post_fc2_attachment": False,
         "fc2_replacement": False,
         "insert_before_last_blocks": 0,
         "insert_on_last_blocks_mlp": num_adapter_blocks,

@@ -32,12 +32,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
 from classifiers.hira import apply_hira_adaptation, build_hira_variant_name
-from classifiers.ranpac import (
-    DEFAULT_RANPAC_FEATURE_STAT_EPS,
-    RANPAC_FEATURE_MODES,
-    apply_ranpac_head,
-    build_ranpac_feature_mode_tag,
-)
+from classifiers.ranpac import apply_ranpac_head
 from classifiers.stability_ridge import (
     DEFAULT_STABILITY_RIDGE_STAT_EPS,
     build_stability_ridge_tag,
@@ -109,14 +104,6 @@ def build_stability_ridge_name_tag(args, separator="-"):
     return build_stability_ridge_tag(
         gamma=args.stability_ridge_gamma,
         stat_eps=args.stability_ridge_stat_eps,
-        separator=separator,
-    )
-
-
-def build_ranpac_feature_name_tag(args, separator="-"):
-    return build_ranpac_feature_mode_tag(
-        feature_mode=args.ranpac_feature_mode,
-        feature_stat_eps=args.ranpac_feature_stat_eps,
         separator=separator,
     )
 
@@ -206,9 +193,9 @@ def parse_args():
     parser.add_argument("--adapt-noise-eps", "--adapt_noise_eps", type=float, default=0.0, help="Linf noise radius used while fitting HiRA and RanPAC adaptation statistics.")
     parser.add_argument("--adapt-noise-num", "--adapt_noise_num", type=int, default=0, help="Number of noisy samples per training image used while fitting HiRA and RanPAC.")
     parser.add_argument("--adapt-alpha", "--adapt_alpha", type=float, default=1.0, help="Total weight assigned to noisy adaptation statistics relative to clean statistics.")
-    parser.add_argument("--soft-threshold-alpha", "--soft_threshold_alpha", type=float, default=0.0, help="Width of the smooth mean-centered threshold in units of feature std; 0 disables it.")
-    parser.add_argument("--soft-threshold-beta", "--soft_threshold_beta", type=float, default=8.0, help="Sharpness of the smooth mean-centered threshold.")
-    parser.add_argument("--soft-threshold-stat-eps", "--soft_threshold_stat_eps", type=float, default=1e-6, help="Minimum feature std used by the smooth mean-centered threshold.")
+    parser.add_argument("--soft-threshold-alpha", "--soft_threshold_alpha", type=float, default=0.0, help="HiRA-only width of the smooth mean-centered threshold in units of hidden-feature std; 0 disables it.")
+    parser.add_argument("--soft-threshold-beta", "--soft_threshold_beta", type=float, default=8.0, help="HiRA-only sharpness of the smooth mean-centered threshold.")
+    parser.add_argument("--soft-threshold-stat-eps", "--soft_threshold_stat_eps", type=float, default=1e-6, help="HiRA-only minimum hidden-feature std used by the smooth mean-centered threshold.")
     parser.add_argument("--stability-ridge-gamma", "--stability_ridge_gamma", type=float, default=0.0, help="Strength of the stability-aware diagonal ridge prior; 0 disables it.")
     parser.add_argument("--stability-ridge-stat-eps", "--stability_ridge_stat_eps", type=float, default=DEFAULT_STABILITY_RIDGE_STAT_EPS, help="Minimum projected-feature std used by the stability-aware ridge prior.")
     parser.add_argument(
@@ -219,20 +206,6 @@ def parse_args():
         help="If set, evaluate only the original model (false) or only the RanPAC model (true).",
     )
     parser.add_argument("--ranpac-rp-dim", "--ranpac_rp_dim", type=int, default=5000, help="RanPAC random projection dimension.")
-    parser.add_argument(
-        "--ranpac-feature-mode",
-        "--ranpac_feature_mode",
-        choices=RANPAC_FEATURE_MODES,
-        default="gelu",
-        help="Projected feature transform used by the RanPAC ridge head.",
-    )
-    parser.add_argument(
-        "--ranpac-feature-stat-eps",
-        "--ranpac_feature_stat_eps",
-        type=float,
-        default=DEFAULT_RANPAC_FEATURE_STAT_EPS,
-        help="Minimum projected-feature std used by non-default RanPAC feature transforms.",
-    )
     parser.add_argument(
         "--ranpac-fit-batch-size",
         "--ranpac_fit_batch_size",
@@ -897,17 +870,12 @@ def main():
                         num_workers=args.num_workers,
                         seed=args.seed,
                         selection_method=variant_cfg["ranpac_selection_method"],
-                        feature_mode=args.ranpac_feature_mode,
-                        feature_stat_eps=args.ranpac_feature_stat_eps,
                         device=device,
                         cache_dir=args.ranpac_cache_dir,
                         train_transform=model_preprocessing,
                         adapt_noise_eps=args.adapt_noise_eps,
                         adapt_noise_num=args.adapt_noise_num,
                         adapt_alpha=args.adapt_alpha,
-                        soft_threshold_alpha=args.soft_threshold_alpha,
-                        soft_threshold_beta=args.soft_threshold_beta,
-                        soft_threshold_stat_eps=args.soft_threshold_stat_eps,
                         stability_ridge_gamma=args.stability_ridge_gamma,
                         stability_ridge_stat_eps=args.stability_ridge_stat_eps,
                         ranpac_lambda=args.ranpac_lambda,
@@ -930,9 +898,7 @@ def main():
                         f"{benchmark_model_name}-htk{args.ranpac_hardneg_topk}"
                         f"-hg{str(args.ranpac_hardneg_gamma).replace('/', '_')}"
                     )
-                if variant_cfg["use_ranpac"]:
-                    benchmark_model_name = f"{benchmark_model_name}{build_ranpac_feature_name_tag(args)}"
-                if (variant_cfg["use_hira"] or variant_cfg["use_ranpac"]) and args.soft_threshold_alpha > 0:
+                if variant_cfg["use_hira"] and args.soft_threshold_alpha > 0:
                     benchmark_model_name = f"{benchmark_model_name}{build_meansparse_name_tag(args)}"
                 if variant_cfg["use_hira"] or variant_cfg["use_ranpac"]:
                     benchmark_model_name = f"{benchmark_model_name}{build_stability_ridge_name_tag(args)}"
@@ -978,8 +944,6 @@ def main():
                         "hira_num_blocks": args.hira_num_blocks if variant_cfg["use_hira"] else None,
                         "use_ranpac": variant_cfg["use_ranpac"],
                         "ranpac_selection_method": variant_cfg["ranpac_selection_method"],
-                        "ranpac_feature_mode": args.ranpac_feature_mode,
-                        "ranpac_feature_stat_eps": args.ranpac_feature_stat_eps,
                         "ranpac_lambda": args.ranpac_lambda,
                         "ranpac_temp": args.ranpac_temp,
                         "ranpac_baseline_bias_centered": variant_cfg["use_ranpac"],
