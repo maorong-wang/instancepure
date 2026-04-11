@@ -45,7 +45,10 @@ def apply_mean_centered_soft_threshold(x, mean, std, alpha, beta, stat_eps=DEFAU
     mean = mean.to(device=x.device, dtype=torch.float32).view(view_shape)
     std = std.to(device=x.device, dtype=torch.float32).clamp_min(float(stat_eps)).view(view_shape)
     diff = x_float - mean
-    radius = diff.abs() / std
+    diff_abs = diff.abs()
+    radius = diff_abs / std
     gate = torch.sigmoid(float(beta) * (radius - float(alpha)))
-    output = mean + gate * diff
+    boundary = float(alpha) * std
+    boundary_aligned_abs = boundary + gate * (diff_abs - boundary)
+    output = mean + diff.sign() * boundary_aligned_abs
     return output.to(dtype=x.dtype)
