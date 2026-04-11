@@ -167,6 +167,7 @@ def get_archs(
     soft_threshold_alpha=0.0,
     soft_threshold_beta=8.0,
     soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+    soft_threshold_mode="away_from_mean",
     stability_ridge_gamma=0.0,
     stability_ridge_stat_eps=DEFAULT_STABILITY_RIDGE_STAT_EPS,
     use_ranpac=False,
@@ -216,6 +217,7 @@ def get_archs(
             soft_threshold_alpha=soft_threshold_alpha,
             soft_threshold_beta=soft_threshold_beta,
             soft_threshold_stat_eps=soft_threshold_stat_eps,
+            soft_threshold_mode=soft_threshold_mode,
             stability_ridge_gamma=stability_ridge_gamma,
             stability_ridge_stat_eps=stability_ridge_stat_eps,
         )
@@ -234,6 +236,7 @@ def get_archs(
             soft_threshold_alpha=soft_threshold_alpha,
             soft_threshold_beta=soft_threshold_beta,
             soft_threshold_stat_eps=soft_threshold_stat_eps,
+            soft_threshold_mode=soft_threshold_mode,
             stability_ridge_gamma=stability_ridge_gamma,
             stability_ridge_stat_eps=stability_ridge_stat_eps,
         )

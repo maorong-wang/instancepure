@@ -29,7 +29,7 @@ Current active code state:
 - Adaptation noise is supported for both RanPAC and HiRA with `adapt_noise_eps`, `adapt_noise_num`, and `adapt_alpha`. The current implementation uses noisy-only adaptation statistics when noise is enabled, rather than mixing clean and noisy stats.
 - Stability-aware diagonal ridge is supported for both RanPAC and HiRA with `stability_ridge_gamma` and `stability_ridge_stat_eps`. The current one-pass implementation builds a diagonal prior from projected train-feature `mean_abs / std` statistics and uses it inside the closed-form ridge solve.
 - RanPAC is back to the original `GELU(W_rand x)` head path; MeanSparse soft-thresholding is no longer applied inside RanPAC.
-- HiRA now attaches before each target MLP, reconstructs the original MLP input during closed-form fitting, and applies MeanSparse only at inference on the hidden `GELU(A(x))` activations, pushing in-band features toward the nearest `mean +/- alpha * std` boundary rather than toward the mean itself.
+- HiRA now attaches before each target MLP, reconstructs the original MLP input during closed-form fitting, and applies MeanSparse only at inference on the hidden `GELU(A(x))` activations. The inference behavior is selectable with `soft_threshold_mode`: `near_mean` reproduces the original smooth pull toward the mean, while `away_from_mean` pushes in-band features toward the nearest `mean +/- alpha * std` boundary.
 - Current RanPAC inference formula is:
   `logit = (1 - ranpac_lambda) * (logit_baseline - mean_train_logits) + ranpac_lambda * (logit_ranpac / ranpac_temp)`.
 - `mean_train_logits` is currently a single global scalar mean over all baseline logits on the clean RanPAC train split, not a per-class vector.

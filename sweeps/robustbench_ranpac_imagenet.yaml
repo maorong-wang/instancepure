@@ -76,6 +76,8 @@ parameters:
     values: [4.0]
   soft_threshold_stat_eps:
     value: 1.0e-6
+  soft_threshold_mode:
+    values: ["near_mean", "away_from_mean"]
   stability_ridge_gamma:
     values: [1.0]
   stability_ridge_stat_eps:

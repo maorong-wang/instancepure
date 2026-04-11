@@ -11,12 +11,15 @@ from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
 from classifiers.mean_sparse import (
+    DEFAULT_MEANSPARSE_MODE,
     DEFAULT_MEANSPARSE_STAT_EPS,
+    MEANSPARSE_MODES,
     apply_mean_centered_soft_threshold,
     build_meansparse_tag,
     format_cache_value,
     is_meansparse_enabled,
     strip_meansparse_tag,
+    validate_meansparse_mode,
 )
 from classifiers.ranpac import RIDGE_CANDIDATES
 from classifiers.stability_ridge import (
@@ -55,6 +58,7 @@ class HiRAAdapter(nn.Module):
         soft_threshold_alpha=0.0,
         soft_threshold_beta=8.0,
         soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+        soft_threshold_mode=DEFAULT_MEANSPARSE_MODE,
     ):
         super().__init__()
         self.register_buffer("b_rand", torch.randn(in_features, expansion_dim, dtype=torch.float16))
@@ -64,6 +68,7 @@ class HiRAAdapter(nn.Module):
         self.soft_threshold_alpha = float(soft_threshold_alpha)
         self.soft_threshold_beta = float(soft_threshold_beta)
         self.soft_threshold_stat_eps = float(soft_threshold_stat_eps)
+        self.soft_threshold_mode = validate_meansparse_mode(soft_threshold_mode)
         self.force_fp32 = False
         self._fp32_cache_device = None
         self._b_rand_fp32 = None
@@ -107,6 +112,7 @@ class HiRAAdapter(nn.Module):
                 alpha=self.soft_threshold_alpha,
                 beta=self.soft_threshold_beta,
                 stat_eps=self.soft_threshold_stat_eps,
+                mode=self.soft_threshold_mode,
             )
         return projected
 
@@ -132,6 +138,7 @@ class HiRAMlpWrapper(nn.Module):
         soft_threshold_alpha=0.0,
         soft_threshold_beta=8.0,
         soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+        soft_threshold_mode=DEFAULT_MEANSPARSE_MODE,
     ):
         super().__init__()
         self.base_mlp = base_mlp
@@ -143,6 +150,7 @@ class HiRAMlpWrapper(nn.Module):
             soft_threshold_alpha=soft_threshold_alpha,
             soft_threshold_beta=soft_threshold_beta,
             soft_threshold_stat_eps=soft_threshold_stat_eps,
+            soft_threshold_mode=soft_threshold_mode,
         )
 
     def forward(self, x, *args, **kwargs):
@@ -201,6 +209,7 @@ def _attach_hira_modules(
     soft_threshold_alpha=0.0,
     soft_threshold_beta=8.0,
     soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+    soft_threshold_mode=DEFAULT_MEANSPARSE_MODE,
 ):
     target_mlp_names = []
     for module_name, module in _resolve_target_mlp_modules(model, num_adapter_blocks):
@@ -208,6 +217,7 @@ def _attach_hira_modules(
             module.mlp_adapter.soft_threshold_alpha = float(soft_threshold_alpha)
             module.mlp_adapter.soft_threshold_beta = float(soft_threshold_beta)
             module.mlp_adapter.soft_threshold_stat_eps = float(soft_threshold_stat_eps)
+            module.mlp_adapter.soft_threshold_mode = validate_meansparse_mode(soft_threshold_mode)
             target_mlp_names.append(module_name)
             continue
         _set_module_by_name(
@@ -219,6 +229,7 @@ def _attach_hira_modules(
                 soft_threshold_alpha=soft_threshold_alpha,
                 soft_threshold_beta=soft_threshold_beta,
                 soft_threshold_stat_eps=soft_threshold_stat_eps,
+                soft_threshold_mode=soft_threshold_mode,
             ),
         )
         target_mlp_names.append(module_name)
@@ -294,6 +305,7 @@ def build_hira_variant_name(
     soft_threshold_alpha=0.0,
     soft_threshold_beta=8.0,
     soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+    soft_threshold_mode=DEFAULT_MEANSPARSE_MODE,
     stability_ridge_gamma=0.0,
     stability_ridge_stat_eps=DEFAULT_STABILITY_RIDGE_STAT_EPS,
 ):
@@ -311,6 +323,7 @@ def build_hira_variant_name(
         beta=soft_threshold_beta,
         stat_eps=soft_threshold_stat_eps,
         separator="-",
+        mode=soft_threshold_mode,
     )
     stability_tag = build_stability_ridge_tag(
         gamma=stability_ridge_gamma,
@@ -344,10 +357,11 @@ def _build_cache_name(
     soft_threshold_alpha,
     soft_threshold_beta,
     soft_threshold_stat_eps,
+    soft_threshold_mode,
     stability_ridge_gamma,
     stability_ridge_stat_eps,
 ):
-    del soft_threshold_alpha, soft_threshold_beta, soft_threshold_stat_eps
+    del soft_threshold_alpha, soft_threshold_beta, soft_threshold_stat_eps, soft_threshold_mode
     return build_hira_variant_name(
         classifier_name=strip_meansparse_tag(classifier_name),
         expansion_dim=expansion_dim,
@@ -363,6 +377,7 @@ def _build_cache_name(
         soft_threshold_alpha=0.0,
         soft_threshold_beta=8.0,
         soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+        soft_threshold_mode=DEFAULT_MEANSPARSE_MODE,
         stability_ridge_gamma=stability_ridge_gamma,
         stability_ridge_stat_eps=stability_ridge_stat_eps,
     ).replace("/", "_") + ".pt"
@@ -747,6 +762,7 @@ def apply_hira_adaptation(
     soft_threshold_alpha=0.0,
     soft_threshold_beta=8.0,
     soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
+    soft_threshold_mode=DEFAULT_MEANSPARSE_MODE,
     stability_ridge_gamma=0.0,
     stability_ridge_stat_eps=DEFAULT_STABILITY_RIDGE_STAT_EPS,
 ):
@@ -762,6 +778,7 @@ def apply_hira_adaptation(
         raise ValueError("HiRA soft_threshold_beta must be positive when soft thresholding is enabled.")
     if soft_threshold_stat_eps <= 0:
         raise ValueError("HiRA soft_threshold_stat_eps must be positive.")
+    validate_meansparse_mode(soft_threshold_mode)
     if stability_ridge_gamma < 0:
         raise ValueError("HiRA stability_ridge_gamma must be non-negative.")
     if stability_ridge_stat_eps <= 0:
@@ -781,6 +798,7 @@ def apply_hira_adaptation(
         soft_threshold_alpha=soft_threshold_alpha,
         soft_threshold_beta=soft_threshold_beta,
         soft_threshold_stat_eps=soft_threshold_stat_eps,
+        soft_threshold_mode=soft_threshold_mode,
     )
     _freeze_model(model)
 
@@ -802,6 +820,7 @@ def apply_hira_adaptation(
             soft_threshold_alpha=soft_threshold_alpha,
             soft_threshold_beta=soft_threshold_beta,
             soft_threshold_stat_eps=soft_threshold_stat_eps,
+            soft_threshold_mode=soft_threshold_mode,
             stability_ridge_gamma=stability_ridge_gamma,
             stability_ridge_stat_eps=stability_ridge_stat_eps,
         ),
@@ -850,6 +869,7 @@ def apply_hira_adaptation(
         "soft_threshold_alpha": soft_threshold_alpha,
         "soft_threshold_beta": soft_threshold_beta,
         "soft_threshold_stat_eps": soft_threshold_stat_eps,
+        "soft_threshold_mode": soft_threshold_mode,
         "stability_ridge_enabled": is_stability_ridge_enabled(stability_ridge_gamma),
         "stability_ridge_gamma": stability_ridge_gamma,
         "stability_ridge_stat_eps": stability_ridge_stat_eps,

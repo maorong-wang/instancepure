@@ -82,6 +82,7 @@ def parse_args():
     parser.add_argument("--soft_threshold_alpha", type=float, default=0.0, help="HiRA-only width of the smooth mean-centered threshold in units of hidden-feature std; 0 disables it")
     parser.add_argument("--soft_threshold_beta", type=float, default=8.0, help="HiRA-only sharpness of the smooth mean-centered threshold")
     parser.add_argument("--soft_threshold_stat_eps", type=float, default=1e-6, help="HiRA-only minimum hidden-feature std used by the smooth mean-centered threshold")
+    parser.add_argument("--soft_threshold_mode", type=str, choices=["near_mean", "away_from_mean"], default="away_from_mean", help="HiRA-only inference sparsification target: pull ambiguous hidden features toward the mean or toward the nearest mean +/- alpha*std boundary")
     parser.add_argument("--stability_ridge_gamma", type=float, default=0.0, help="strength of the stability-aware diagonal ridge prior; 0 disables it")
     parser.add_argument("--stability_ridge_stat_eps", type=float, default=DEFAULT_STABILITY_RIDGE_STAT_EPS, help="minimum projected-feature std used by the stability-aware ridge prior")
     parser.add_argument("--attack_method", default="Linf_pgd", type=str, help="attack model")
@@ -158,6 +159,7 @@ def build_meansparse_tag(args):
     tag = (
         f"_msa{_format_variant_noise_value(args.soft_threshold_alpha)}"
         f"_msb{_format_variant_noise_value(args.soft_threshold_beta)}"
+        f"_msm{'near' if args.soft_threshold_mode == 'near_mean' else 'away'}"
     )
     if args.soft_threshold_stat_eps != 1e-6:
         tag = f"{tag}_mseps{_format_variant_noise_value(args.soft_threshold_stat_eps)}"
@@ -496,6 +498,7 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         soft_threshold_alpha=args.soft_threshold_alpha,
         soft_threshold_beta=args.soft_threshold_beta,
         soft_threshold_stat_eps=args.soft_threshold_stat_eps,
+        soft_threshold_mode=args.soft_threshold_mode,
         stability_ridge_gamma=args.stability_ridge_gamma,
         stability_ridge_stat_eps=args.stability_ridge_stat_eps,
         use_ranpac=args.use_ranpac_head,
@@ -636,6 +639,7 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         "soft_threshold_alpha": args.soft_threshold_alpha,
         "soft_threshold_beta": args.soft_threshold_beta,
         "soft_threshold_stat_eps": args.soft_threshold_stat_eps,
+        "soft_threshold_mode": args.soft_threshold_mode,
         "ranpac_lambda": args.ranpac_lambda,
         "ranpac_temp": args.ranpac_temp,
         "ranpac_baseline_bias_centered": args.use_ranpac_head,
