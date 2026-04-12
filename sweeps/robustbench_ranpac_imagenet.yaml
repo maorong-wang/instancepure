@@ -16,7 +16,7 @@ parameters:
     value: ./robustbench_models
   model_names:
     values:
-      - Liu2023Comprehensive_Swin-L
+      # - Liu2023Comprehensive_Swin-L
       - Xu2024MIMIR_Swin-L
   use_hira:
     values: [true]
@@ -29,7 +29,7 @@ parameters:
   eval_split:
     value: test
   eval_batch_size:
-    value: 64
+    value: 64 
   num_workers:
     value: 4
   eps:
@@ -43,9 +43,9 @@ parameters:
   hira_expansion_dim:
     values: [8192]
   hira_num_blocks:
-    values: [4]
+    values: [24]
   hira_batch_size:
-    value: 256
+    value: 128
   hira_num_workers:
     value: 4
   hira_epochs:
@@ -77,7 +77,7 @@ parameters:
   soft_threshold_stat_eps:
     value: 1.0e-6
   soft_threshold_mode:
-    values: ["near_mean", "away_from_mean"]
+    values: ["away_from_mean"]
   stability_ridge_gamma:
     values: [0.0]
   stability_ridge_stat_eps:
@@ -93,7 +93,7 @@ parameters:
   ranpac_hardneg_gamma:
     value: 0.0
   ranpac_fit_batch_size:
-    value: 256
+    value: 64
   ranpac_cache_dir:
     value: pretrained/ranpac_robustbench
   seed:
