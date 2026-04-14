@@ -16,8 +16,10 @@ parameters:
     value: ./robustbench_models
   model_names:
     values:
-      # - Liu2023Comprehensive_Swin-L
-      - Xu2024MIMIR_Swin-L
+      - Singh2023Revisiting_ViT-B-ConvStem
+      - Singh2023Revisiting_ViT-S-ConvStem
+      - RodriguezMunoz2024Characterizing_Swin-L
+      - RodriguezMunoz2024Characterizing_Swin-B
   use_hira:
     values: [true]
   use_ranpac:
@@ -61,11 +63,11 @@ parameters:
   hira_dataset_root:
     value: ./dataset/imagenet
   hira_max_train_samples:
-    values: [100000]
+    values: [-1]
   hira_force_retrain:
     value: false
   adapt_noise_eps:
-    value: 0.04705882352
+    value: 0
   adapt_noise_num:
     value: 1
   adapt_alpha:
@@ -73,7 +75,7 @@ parameters:
   soft_threshold_alpha:
     values: [.9]
   soft_threshold_beta:
-    values: [2.0, 4.0, 16.0, 32.0]
+    values: [4.0]
   soft_threshold_stat_eps:
     value: 1.0e-6
   soft_threshold_mode:
