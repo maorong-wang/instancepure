@@ -8,4 +8,4 @@ module purge
 module load cuda
 source ~/.bashrc
 conda activate diffpure
-wandb agent maorong-wang/robustbench-ranpac-hira-rc-sweep/ioz9pqhp
+wandb agent maorong-wang/robustbench-ranpac-hira-rc-sweep_depth/myd1d161

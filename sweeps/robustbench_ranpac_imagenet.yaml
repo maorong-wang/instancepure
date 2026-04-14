@@ -1,6 +1,6 @@
 program: eval_robustbench_ranpac.py
 method: grid
-project: robustbench-ranpac-hira-rc-sweep
+project: robustbench-ranpac-hira-rc-sweep_depth
 name: robustbench-ranpac-hira-imagenet
 metric:
   name: robust_acc
@@ -29,7 +29,7 @@ parameters:
   eval_split:
     value: test
   eval_batch_size:
-    value: 64 
+    value: 128
   num_workers:
     value: 4
   eps:
@@ -41,9 +41,9 @@ parameters:
   autoattack_version:
     values: [standard]
   hira_expansion_dim:
-    values: [8192]
+    values: [16384]
   hira_num_blocks:
-    values: [24]
+    values: [4]
   hira_batch_size:
     value: 128
   hira_num_workers:
@@ -71,9 +71,9 @@ parameters:
   adapt_alpha:
     value: 1
   soft_threshold_alpha:
-    values: [0.3]
+    values: [.9]
   soft_threshold_beta:
-    values: [8.0]
+    values: [2.0, 4.0, 16.0, 32.0]
   soft_threshold_stat_eps:
     value: 1.0e-6
   soft_threshold_mode:
