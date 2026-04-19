@@ -1,129 +1,89 @@
 # modify on top of https://github.com/xavihart/Diff-PGD
 
-import os
-import sys
-from pathlib import Path
-
-from PIL import Image, ImageFilter
-from load_dm import get_imagenet_dm_conf
-from dataset import get_dataset
-from utils import *
-import torch
-import torchvision
-from tqdm.auto import tqdm
-import random
-from archs import get_archs, IMAGENET_MODEL
-from classifiers.stability_ridge import (
-    DEFAULT_STABILITY_RIDGE_STAT_EPS,
-    build_stability_ridge_tag,
-)
-import matplotlib.pylab as plt
-import time
-import glob
-import pandas as pd
-import torchvision.transforms.functional as TF
-import torch.nn.functional as F
-from torchvision.transforms import Resize, Grayscale, GaussianBlur
-# from torchmetrics.image import SSIM, PSNR
-# from torcheval.metrics import FrechetInceptionDistance as FID
-from diffusers import LCMScheduler, TCDScheduler, StableDiffusionControlNetImg2ImgPipeline, ControlNetModel
-from diffusers.utils import *
-from peft import LoraConfig
-from datasets import load_dataset
 import argparse
-from autoattack import AutoAttack
-import cv2
-# import lpips
-from safetensors.torch import load_file
-from peft import get_peft_model_state_dict
+import os
+import random
+
+import numpy as np
+import pandas as pd
+import torch
 from torch.utils.data import DataLoader, Subset
-# from dame_recon.purifier import *
-# from advex_uar.attacks.snow_attack import *
-# from advex_uar.attacks.fog_attack import *
-# from advex_uar.attacks.gabor_attack import *
-import foolbox as fb
+from tqdm.auto import tqdm
+
+from attacks import build_attack, gen_pgd_confs
+from classifiers.stability_ridge import DEFAULT_STABILITY_RIDGE_STAT_EPS, build_stability_ridge_tag
+from dataset import get_dataset
+from purifiers import PurifiedClassifier, build_purifier
+from utils import finish_wandb, init_wandb, log_wandb_metrics, str2bool
+from victims import IMAGENET_MODEL, apply_victim_wrappers, build_imagenet_victim, build_wrapper_config_from_namespace, supports_hira
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="choose using LCM/TCD and original/adversarial Lora")
-    parser.add_argument("--model", required=True, type=str, help="tcd or lcm")
-    parser.add_argument("--load_origin_lora", default=False, action="store_true",
-                        help="using original/adversarial Lora")
-    parser.add_argument("--lora_input_dir", type=str, help="input lora directory")
-    parser.add_argument("--output_dir", default="vis_and_stat/", type=str, help="output directory")
-    parser.add_argument("--num_validation_set", default=1000, type=int, help="size of subset of validation set")
-    parser.add_argument("--num_inference_step", default=1, type=int, help="inference step of diffusion model")
-    parser.add_argument("--strength", default=0.1, type=float, help="noise added to the original image")
-    parser.add_argument("--seed", default=3407, type=int, help="seed for random number generator")
-    parser.add_argument("--guidance_scale", default=1.0, type=float, help="guidance scale of diffusion model")
-    parser.add_argument("--control_scale", default=0.8, type=float, help="control sclae of diffusion model")
-    parser.add_argument("--input_image", default="./image_net", type=str, help="input image directory")
-    parser.add_argument(
-        "--classifier",
-        default="resnet50",
-        type=str,
-        help=f"classification model. Available: {', '.join(IMAGENET_MODEL)}",
-    )
-    parser.add_argument("--use_hira_adapter", type=str2bool, default=False, help="attach HiRA before the MLP of the last N transformer blocks for ViT-family backbones")
-    parser.add_argument("--hira_expansion_dim", type=int, default=4096, help="hidden expansion dimension for HiRA adapters")
-    parser.add_argument("--hira_num_blocks", type=int, default=2, help="number of final transformer MLP blocks that receive HiRA adapters")
-    parser.add_argument("--hira_batch_size", type=int, default=32, help="batch size used to fit closed-form HiRA weights")
-    parser.add_argument("--hira_num_workers", type=int, default=8, help="number of workers used to fit closed-form HiRA weights")
-    parser.add_argument("--hira_epochs", type=int, default=1, help="legacy compatibility flag; closed-form HiRA ignores this value")
-    parser.add_argument("--hira_lr", type=float, default=1e-4, help="legacy compatibility flag; closed-form HiRA ignores this value")
-    parser.add_argument("--hira_weight_decay", type=float, default=1e-4, help="legacy compatibility flag; closed-form HiRA ignores this value")
-    parser.add_argument("--hira_seed", type=int, default=0, help="seed used for HiRA projection sampling and dataset split")
-    parser.add_argument("--hira_cache_dir", type=str, default="pretrained/hira", help="cache directory for fitted HiRA weights")
-    parser.add_argument("--hira_dataset_root", type=str, default=None, help="ImageNet root used when fitting closed-form HiRA weights")
-    parser.add_argument("--hira_max_train_samples", type=int, default=-1, help="optional cap on ImageNet train samples used to fit closed-form HiRA")
-    parser.add_argument("--hira_force_retrain", type=str2bool, default=False, help="ignore cached HiRA weights and fit again")
-    parser.add_argument("--adapt_noise_eps", type=float, default=0.0, help="Linf noise radius used while fitting HiRA and RanPAC adaptation statistics")
-    parser.add_argument("--adapt_noise_num", type=int, default=0, help="number of noisy samples per training image used while fitting HiRA and RanPAC")
-    parser.add_argument("--adapt_alpha", type=float, default=1.0, help="total weight assigned to noisy adaptation statistics relative to clean statistics")
-    parser.add_argument("--soft_threshold_alpha", type=float, default=0.0, help="HiRA-only width of the smooth mean-centered threshold in units of hidden-feature std; 0 disables it")
-    parser.add_argument("--soft_threshold_beta", type=float, default=8.0, help="HiRA-only sharpness of the smooth mean-centered threshold")
-    parser.add_argument("--soft_threshold_stat_eps", type=float, default=1e-6, help="HiRA-only minimum hidden-feature std used by the smooth mean-centered threshold")
-    parser.add_argument("--soft_threshold_mode", type=str, choices=["near_mean", "away_from_mean"], default="away_from_mean", help="HiRA-only inference sparsification target: pull ambiguous hidden features toward the mean or toward the nearest mean +/- alpha*std boundary")
-    parser.add_argument("--stability_ridge_gamma", type=float, default=0.0, help="strength of the stability-aware diagonal ridge prior; 0 disables it")
-    parser.add_argument("--stability_ridge_stat_eps", type=float, default=DEFAULT_STABILITY_RIDGE_STAT_EPS, help="minimum projected-feature std used by the stability-aware ridge prior")
-    parser.add_argument("--attack_method", default="Linf_pgd", type=str, help="attack model")
-    parser.add_argument("--device", default="cuda:0", help="device, e.g. cuda:0")
-    parser.add_argument("--use_ranpac_head", type=str2bool, default=False, help="replace the final linear layer with a RanPAC ridge head")
-    parser.add_argument("--ranpac_rp_dim", type=int, default=5000, help="random projection dimension for RanPAC")
-    parser.add_argument("--ranpac_batch_size", type=int, default=256, help="batch size used to fit the RanPAC head")
-    parser.add_argument("--ranpac_num_workers", type=int, default=8, help="number of workers used to fit the RanPAC head")
-    parser.add_argument("--ranpac_seed", type=int, default=0, help="seed used to build the RanPAC random projection")
-    parser.add_argument("--ranpac_lambda", type=float, default=1.0, help="convex mixing weight between the original classifier head and the temperature-scaled RanPAC head")
-    parser.add_argument("--ranpac_temp", type=float, default=1.0, help="temperature applied to the RanPAC logits before ensembling")
-    parser.add_argument("--ranpac_hardneg_topk", type=int, default=9, help="number of top confusing non-ground-truth classes to suppress in the RanPAC regression targets")
-    parser.add_argument("--ranpac_hardneg_gamma", type=float, default=1.0, help="total suppression weight assigned across the RanPAC hard-negative classes")
-    parser.add_argument(
-        "--ranpac_selection_method",
-        type=str,
-        choices=["regression"],
-        default="regression",
-        help="which cached RanPAC head to apply; only regression-loss ridge selection is supported",
-    )
-    parser.add_argument("--ranpac_cache_dir", type=str, default="pretrained/ranpac", help="cache directory for fitted RanPAC heads")
-    parser.add_argument("--ranpac_dataset_root", type=str, default=None, help="ImageNet root used when fitting a RanPAC head")
-    parser.add_argument("--stadv_num_iterations", type=int, default=100, help="number of optimization steps for the DiffPure stadv attack")
-    parser.add_argument("--stadv_eot_iter", type=int, default=20, help="EOT iterations for the DiffPure stadv attack")
-    parser.add_argument("--use_wandb", type=str2bool, default=False, help="log final metrics to Weights & Biases")
-    parser.add_argument("--wandb_project", type=str, default="instantpure", help="Weights & Biases project name")
-    parser.add_argument("--wandb_entity", type=str, default="", help="Weights & Biases entity")
-    parser.add_argument("--wandb_name", type=str, default="", help="Weights & Biases run name")
-    parser.add_argument("--wandb_group", type=str, default="", help="Weights & Biases run group")
-    parser.add_argument("--wandb_mode", type=str, default="online", help="Weights & Biases mode: online, offline, or disabled")
-    parser.add_argument(
-        "--attack_version",
-        type=str,
-        choices=["v1", "v2"],
-        default="v1",
-        help="Attack pipeline version: v1 attacks the raw classifier, v2 runs DiffPGD through the denoiser.",
-    )
-    parser.add_argument("--atk_iter", type=int, default=40, help="")
-    parser.add_argument("--eps", type=int, default=4, help="")
-    args = parser.parse_args()
-    return args
+    parser = argparse.ArgumentParser(description="Evaluate purified or unpurified ImageNet victims with optional HiRA/RanPAC protection.")
+    parser.add_argument("--model", default="LCM", type=str, help="InstantPure purifier model: lcm or tcd. Ignored when --purifier_name none.")
+    parser.add_argument("--purifier_name", type=str, choices=["none", "instantpure", "instancepure", "puriflow"], default="instantpure", help="Purifier backend applied before the wrapped victim.")
+    parser.add_argument("--load_origin_lora", default=False, action="store_true", help="Use the original LoRA mixed with the adversarial LoRA for InstantPure.")
+    parser.add_argument("--lora_input_dir", type=str, help="Input LoRA directory for the purifier backend.")
+    parser.add_argument("--output_dir", default="vis_and_stat/", type=str, help="Output directory for metrics and optional artifacts.")
+    parser.add_argument("--num_validation_set", default=1000, type=int, help="Size of the validation subset.")
+    parser.add_argument("--num_inference_step", default=1, type=int, help="Purifier inference steps.")
+    parser.add_argument("--strength", default=0.1, type=float, help="Purifier noise strength.")
+    parser.add_argument("--seed", default=3407, type=int, help="Seed for all RNGs.")
+    parser.add_argument("--guidance_scale", default=1.0, type=float, help="Purifier guidance scale.")
+    parser.add_argument("--control_scale", default=0.8, type=float, help="Purifier control scale.")
+    parser.add_argument("--input_image", default="./image_net", type=str, help="Unused legacy compatibility flag.")
+    parser.add_argument("--classifier", default="resnet50", type=str, help=f"Victim classification model. Available aliases: {', '.join(IMAGENET_MODEL)}")
+    parser.add_argument("--use_hira_adapter", "--use_hira", type=str2bool, default=False, help="Attach HiRA before the MLP of the last N transformer blocks for ViT-family backbones.")
+    parser.add_argument("--hira_expansion_dim", type=int, default=4096, help="Hidden expansion dimension for HiRA adapters.")
+    parser.add_argument("--hira_num_blocks", type=int, default=2, help="Number of final transformer MLP blocks that receive HiRA adapters.")
+    parser.add_argument("--hira_batch_size", type=int, default=32, help="Batch size used to fit closed-form HiRA weights.")
+    parser.add_argument("--hira_num_workers", type=int, default=8, help="Number of workers used to fit closed-form HiRA weights.")
+    parser.add_argument("--hira_epochs", type=int, default=1, help="Legacy compatibility flag; closed-form HiRA ignores this value.")
+    parser.add_argument("--hira_lr", type=float, default=1e-4, help="Legacy compatibility flag; closed-form HiRA ignores this value.")
+    parser.add_argument("--hira_weight_decay", type=float, default=1e-4, help="Legacy compatibility flag; closed-form HiRA ignores this value.")
+    parser.add_argument("--hira_seed", type=int, default=0, help="Seed used for HiRA projection sampling and dataset split.")
+    parser.add_argument("--hira_cache_dir", type=str, default="pretrained/hira", help="Cache directory for fitted HiRA weights.")
+    parser.add_argument("--hira_dataset_root", type=str, default=None, help="ImageNet root used when fitting closed-form HiRA weights.")
+    parser.add_argument("--hira_max_train_samples", type=int, default=-1, help="Optional cap on ImageNet train samples used to fit closed-form HiRA.")
+    parser.add_argument("--hira_force_retrain", type=str2bool, default=False, help="Ignore cached HiRA weights and fit again.")
+    parser.add_argument("--adapt_noise_eps", type=float, default=0.0, help="Linf noise radius used while fitting HiRA and RanPAC adaptation statistics.")
+    parser.add_argument("--adapt_noise_num", type=int, default=0, help="Number of noisy samples per training image used while fitting HiRA and RanPAC.")
+    parser.add_argument("--adapt_alpha", type=float, default=1.0, help="Total weight assigned to noisy adaptation statistics relative to clean statistics.")
+    parser.add_argument("--soft_threshold_alpha", type=float, default=0.0, help="HiRA-only width of the smooth mean-centered threshold in units of hidden-feature std; 0 disables it.")
+    parser.add_argument("--soft_threshold_beta", type=float, default=8.0, help="HiRA-only sharpness of the smooth mean-centered threshold.")
+    parser.add_argument("--soft_threshold_stat_eps", type=float, default=1e-6, help="HiRA-only minimum hidden-feature std used by the smooth mean-centered threshold.")
+    parser.add_argument("--soft_threshold_mode", type=str, choices=["near_mean", "away_from_mean"], default="away_from_mean", help="HiRA-only inference sparsification target: pull ambiguous hidden features toward the mean or toward the nearest mean +/- alpha*std boundary.")
+    parser.add_argument("--stability_ridge_gamma", type=float, default=0.0, help="Strength of the stability-aware diagonal ridge prior; 0 disables it.")
+    parser.add_argument("--stability_ridge_stat_eps", type=float, default=DEFAULT_STABILITY_RIDGE_STAT_EPS, help="Minimum projected-feature std used by the stability-aware ridge prior.")
+    parser.add_argument("--attack_method", default="Linf_pgd", type=str, help="Attack backend. Use diff_pgd for the current SDEdit-based diffusion PGD attack. Standard attacks hit the selected attack target.")
+    parser.add_argument("--attack_target", choices=["victim", "purified"], default="victim", help="Which composed model standard attacks should target.")
+    parser.add_argument("--device", default="cuda:0", help="Device, e.g. cuda:0")
+    parser.add_argument("--use_ranpac_head", "--use_ranpac", type=str2bool, default=False, help="Replace the final linear layer with a RanPAC ridge head.")
+    parser.add_argument("--ranpac_rp_dim", type=int, default=5000, help="Random projection dimension for RanPAC.")
+    parser.add_argument("--ranpac_batch_size", "--ranpac_fit_batch_size", type=int, default=256, help="Batch size used to fit the RanPAC head.")
+    parser.add_argument("--ranpac_num_workers", type=int, default=8, help="Number of workers used to fit the RanPAC head.")
+    parser.add_argument("--ranpac_seed", type=int, default=0, help="Seed used to build the RanPAC random projection.")
+    parser.add_argument("--ranpac_lambda", type=float, default=1.0, help="Convex mixing weight between the original classifier head and the temperature-scaled RanPAC head.")
+    parser.add_argument("--ranpac_temp", type=float, default=1.0, help="Temperature applied to the RanPAC logits before ensembling.")
+    parser.add_argument("--ranpac_hardneg_topk", type=int, default=9, help="Number of top confusing non-ground-truth classes to suppress in the RanPAC regression targets.")
+    parser.add_argument("--ranpac_hardneg_gamma", type=float, default=1.0, help="Total suppression weight assigned across the RanPAC hard-negative classes.")
+    parser.add_argument("--ranpac_selection_method", type=str, choices=["regression"], default="regression", help="Which cached RanPAC head to apply; only regression-loss ridge selection is supported.")
+    parser.add_argument("--ranpac_cache_dir", type=str, default="pretrained/ranpac", help="Cache directory for fitted RanPAC heads.")
+    parser.add_argument("--ranpac_dataset_root", type=str, default=None, help="ImageNet root used when fitting a RanPAC head.")
+    parser.add_argument("--stadv_num_iterations", type=int, default=100, help="Number of optimization steps for the DiffPure stadv attack.")
+    parser.add_argument("--stadv_eot_iter", type=int, default=20, help="EOT iterations for the DiffPure stadv attack.")
+    parser.add_argument("--use_wandb", type=str2bool, default=False, help="Log final metrics to Weights & Biases.")
+    parser.add_argument("--wandb_project", type=str, default="instantpure", help="Weights & Biases project name.")
+    parser.add_argument("--wandb_entity", type=str, default="", help="Weights & Biases entity.")
+    parser.add_argument("--wandb_name", type=str, default="", help="Weights & Biases run name.")
+    parser.add_argument("--wandb_group", type=str, default="", help="Weights & Biases run group.")
+    parser.add_argument("--wandb_mode", type=str, default="online", help="Weights & Biases mode: online, offline, or disabled.")
+    parser.add_argument("--attack_version", type=str, choices=["v1", "v2"], default="v1", help="Attack pipeline version: v1 attacks the selected attack target directly; v2 uses the current SDEdit-based diffusion PGD backend.")
+    parser.add_argument("--atk_iter", type=int, default=40, help="Attack steps.")
+    parser.add_argument("--eps", type=int, default=4, help="Attack epsilon in pixel-space units out of 255.")
+    parser.add_argument("--diffusion_respace", type=str, default="ddim50", help="Guided diffusion timestep respacing used by the InstantPure backend.")
+    parser.add_argument("--diffusion_timestep", type=int, default=150, help="Guided diffusion timestep used by the current SDEdit-based diffusion attack backend.")
+    return parser.parse_args()
 
 
 def resolve_device(device):
@@ -174,268 +134,8 @@ def build_stability_ridge_variant_tag(args):
     )
 
 
-def load_diffpure_stadv_attack():
-    diffpure_root = Path(__file__).resolve().parent.parent / "DiffPure"
-    if not diffpure_root.exists():
-        raise ImportError(f"DiffPure was not found at {diffpure_root}.")
-
-    diffpure_root_str = str(diffpure_root)
-    if diffpure_root_str not in sys.path:
-        sys.path.insert(0, diffpure_root_str)
-
-    from stadv_eot.attacks import StAdvAttack
-
-    return StAdvAttack
-
-
-def gen_pgd_confs(eps, alpha, iter, input_range=(0, 1)):
-    scale = float(input_range[1] - input_range[0]) / 255.0
-    return {
-        "eps": eps * scale,
-        "alpha": alpha * scale,
-        "iter": iter,
-        "input_range": input_range,
-    }
-
-
-def sample_eval_subset(dataset, num_samples, seed):
-    if num_samples >= len(dataset):
-        return dataset
-
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-    indices = torch.randperm(len(dataset), generator=generator)[:num_samples].tolist()
-    return Subset(dataset, indices)
-
-def seed_everything(seed=3407):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-def get_module_kohya_state_dict(module, prefix: str, dtype: torch.dtype, adapter_name: str = "default"):
-    kohya_ss_state_dict = {}
-    for peft_key, weight in get_peft_model_state_dict(module, adapter_name=adapter_name).items():
-        kohya_key = peft_key.replace("base_model.model", prefix)
-        kohya_key = kohya_key.replace("lora_A", "lora_down")
-        kohya_key = kohya_key.replace("lora_B", "lora_up")
-        kohya_key = kohya_key.replace(".", "_", kohya_key.count(".") - 2)
-        kohya_ss_state_dict[kohya_key] = weight.to(dtype)
-
-        # Set alpha parameter
-        if "lora_down" in kohya_key:
-            alpha_key = f'{kohya_key.split(".")[0]}.alpha'
-            kohya_ss_state_dict[alpha_key] = torch.tensor(module.peft_config[adapter_name].lora_alpha).to(dtype)
-
-    return kohya_ss_state_dict
-
-class Denoised_Classifier(torch.nn.Module):
-    def __init__(self, classifier, pipe, device, diffusion, model, t):
-        super().__init__()
-        self.classifier = classifier
-        self.pipe = pipe
-        self.device = device
-        self.diffusion = diffusion
-        self.model = model
-        self.t = t
-
-    def _resolve_diffusion_timestep(self, t):
-        requested_t = int(t)
-        if hasattr(self.diffusion, "timestep_map") and self.diffusion.timestep_map:
-            valid_steps = list(self.diffusion.timestep_map)
-            floor_index = 0
-            for index, original_step in enumerate(valid_steps):
-                if original_step > requested_t:
-                    break
-                floor_index = index
-            return floor_index
-        max_t = len(self.diffusion.sqrt_alphas_cumprod) - 1
-        return max(0, min(requested_t, max_t))
-
-    def sdedit(self, x, t, to_01=True):
-        resolved_t = self._resolve_diffusion_timestep(t)
-
-        x = x * 2 - 1
-
-        t_tensor = torch.full((x.shape[0],), resolved_t, dtype=torch.long, device=x.device)
-
-        x_t = self.diffusion.q_sample(x, t_tensor)
-
-        sample = x_t
-
-        indices = list(range(resolved_t + 1))[::-1]
-
-        # visualize
-        l_sample = []
-        l_predxstart = []
-
-        for i in indices:
-            out = self.diffusion.ddim_sample(self.model, sample, torch.full((x.shape[0],), i).long().to(x.device))
-   
-            sample = out["sample"]
-
-        # the output of diffusion model is [-1, 1], should be transformed to [0, 1]
-        if to_01:
-            sample = (sample + 1) / 2
-
-        return sample
-
-    def lcm_lora_denoise(self, x, pipe, device, to_512=False):
-        batch = x.shape[0]
-        prompt = ["" for _ in range(batch)]
-
-        size = x.size()[-1]
-        if size != 512:
-            x = F.interpolate(x, size=(512, 512), mode="bilinear")
-
-        start=time.time()
-
-        pil_x = TF.to_pil_image(x.squeeze(0))
-        image = np.array(pil_x)
-        image = cv2.Canny(image, 100, 200)
-        image = image[:, :, None]
-        image = np.concatenate([image, image, image], axis=2)
-        control_image = Image.fromarray(image)
-        control_image = control_image.resize((512, 512), resample=Image.NEAREST)
-
-        x = torch.clamp(x, 0, 1)  # assume the input is 0-1
-        generator = torch.manual_seed(args.seed)
-
-        image = pipe(
-            prompt=prompt,
-            image=x,
-            control_image=control_image,
-            num_inference_steps=args.num_inference_step,
-            guidance_scale=args.guidance_scale,
-            strength=args.strength,
-            controlnet_conditioning_scale=args.control_scale,
-            generator=generator,
-            output_type="pt",
-            return_dict=False
-        )
-
-        out_image = F.interpolate(image[0], size=(size, size), mode="bilinear")
-
-        end_time = time.time()
-        print("run time:", end_time - start)
-
-        return out_image, control_image.resize((size, size))
-
-    def forward(self, x):
-        out = self.lcm_lora_denoise(x, self.pipe, self.device)  # [0, 1]
-        out = self.classifier(out)
-        return out
-
-def generate_x_adv(x, y, classifier, pgd_conf, device):
-    net = classifier
-
-    def run_foolbox_pgd(attack_cls, eps, abs_stepsize, criterion):
-        fmodel = fb.PyTorchModel(net, bounds=(0, 1), device=device)
-        attack = attack_cls(
-            steps=pgd_conf["iter"],
-            random_start=False,
-            abs_stepsize=abs_stepsize,
-        )
-        _, clipped_advs, _ = attack(fmodel, x, criterion, epsilons=[eps])
-        return clipped_advs[0] if isinstance(clipped_advs, (list, tuple)) else clipped_advs[0]
-
-    if args.attack_method == "Linf_pgd":
-        x_adv = run_foolbox_pgd(
-            fb.attacks.LinfPGD,
-            eps=pgd_conf["eps"],
-            abs_stepsize=pgd_conf["alpha"],
-            criterion=y,
-        )
-
-    elif args.attack_method == "L2_pgd":
-        x_adv = run_foolbox_pgd(
-            fb.attacks.L2PGD,
-            eps=0.5,
-            abs_stepsize=0.1,
-            criterion=y,
-        )
-
-    elif args.attack_method == "stadv":
-        StAdvAttack = load_diffpure_stadv_attack()
-        adversary = StAdvAttack(
-            net,
-            bound=pgd_conf["eps"],
-            num_iterations=args.stadv_num_iterations,
-            eot_iter=args.stadv_eot_iter,
-        )
-        x_adv = adversary(x, y)
-
-    elif args.attack_method == "AutoAttack":
-        adversary = AutoAttack(classifier, norm='Linf', eps=pgd_conf["eps"], version='standard', device=device)
-        x_adv = adversary.run_standard_evaluation(x, y, bs=1)
-
-    elif args.attack_method == "target_Linf_pgd":
-        label_offset = torch.randint(low=1, high=1000, size=y.shape, generator=None).to(device)
-        random_target = torch.remainder(y + label_offset, 1000).to(device)
-        x_adv = run_foolbox_pgd(
-            fb.attacks.LinfPGD,
-            eps=pgd_conf["eps"],
-            abs_stepsize=pgd_conf["alpha"],
-            criterion=fb.criteria.TargetedMisclassification(random_target),
-        )
-
-    elif args.attack_method == "snow":
-        x_adv = SnowAttack(
-            nb_its=10, eps_max=0.0625, step_size=0.002236, resol=224
-        )._forward(net, x*255, y, scale_eps=False, avoid_target=True)/255
-    elif args.attack_method == "fog":
-        x_adv = FogAttack(
-            nb_its=10, eps_max=128, step_size=0.002236, resol=224
-        )._forward(net, x*255, y, scale_eps=False, avoid_target=True)/255
-    elif args.attack_method == "gabor":
-        x_adv = GaborAttack(
-            nb_its=10, eps_max=12.5, step_size=0.002236, resol=224
-        )._forward(net, x*255, y, scale_eps=False, avoid_target=True)/255
-    else:
-        raise NotImplementedError
-    return x_adv.to(device)
-
-
-def generate_x_adv_denoised_v2(x, y, diffusion, model, classifier, pgd_conf, device, t, pipe):
-    net = Denoised_Classifier(classifier, pipe, device, diffusion, model, t)
-
-    delta = torch.zeros(x.shape).to(x.device)
-    # delta.requires_grad_()
-
-    loss_fn = torch.nn.CrossEntropyLoss(reduction="sum")
-
-    eps = pgd_conf['eps']
-    alpha = pgd_conf['alpha']
-    iter = pgd_conf['iter']
-
-    for pgd_iter_id in range(iter):
-
-        x_diff = net.sdedit(x+delta, t).detach()
-
-        x_diff.requires_grad_()
-
-        with torch.enable_grad():
-            loss = loss_fn(classifier(x_diff), y)
-
-            loss.backward()
-
-            grad_sign = x_diff.grad.data.sign()
-
-        delta += grad_sign * alpha
-
-        delta = torch.clamp(delta, -eps, eps)
-    print("Done")
-
-    x_adv = torch.clamp(x + delta, 0, 1)
-    return x_adv.detach()
-
-def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_global', alpha=2, version="v1"):
-    pgd_conf = gen_pgd_confs(eps=eps, alpha=alpha, iter=iter, input_range=(0, 1))
-    device = resolve_device(device)
-    classifier_variant = classifier
+def build_classifier_variant_name(args):
+    classifier_variant = args.classifier
     adapt_noise_tag = build_adapt_noise_tag(args)
     meansparse_tag = build_meansparse_tag(args)
     stability_ridge_tag = build_stability_ridge_variant_tag(args)
@@ -460,179 +160,119 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         classifier_variant = f"{classifier_variant}{meansparse_tag}"
     if stability_ridge_tag and (args.use_hira_adapter or args.use_ranpac_head):
         classifier_variant = f"{classifier_variant}{stability_ridge_tag}"
-    lora_dir = args.lora_input_dir or "no_lora"
+    return classifier_variant
 
-    if args.load_origin_lora:
-        save_path = os.path.join(
-            args.output_dir,
-            f"{args.attack_method}/{classifier_variant}/{args.model}/origin_lora_1/{lora_dir}/num_inference_step_{args.num_inference_step}_strength_{int(args.strength * 1000)}_guidance_scale_{args.guidance_scale}_{args.num_validation_set}_control_scale_{args.control_scale}",
-        )
-    else:
-        save_path = os.path.join(
-            args.output_dir,
-            f"{args.attack_method}/{classifier_variant}/{args.model}/{lora_dir}/num_inference_step_{args.num_inference_step}_strength_{int(args.strength * 1000)}_guidance_scale_{args.guidance_scale}_{args.num_validation_set}_control_scale_{args.control_scale}",
-        )
 
-    os.makedirs(save_path, exist_ok=True)
-    wandb_run = init_wandb(args, save_path)
-    seed_everything(args.seed)
-    classifier = get_archs(
+def build_purifier_variant_name(args):
+    if args.purifier_name == "none":
+        return "no_purifier"
+    if args.purifier_name == "instantpure":
+        lora_dir = (args.lora_input_dir or "no_lora").replace("/", "_")
+        origin_tag = "origin_lora_1" if args.load_origin_lora else "origin_lora_0"
+        return (
+            f"instantpure_{args.model.lower()}_{origin_tag}_{lora_dir}"
+            f"_nstep{args.num_inference_step}"
+            f"_strength{int(args.strength * 1000)}"
+            f"_g{_format_variant_noise_value(args.guidance_scale)}"
+            f"_c{_format_variant_noise_value(args.control_scale)}"
+        )
+    return args.purifier_name
+
+
+def sample_eval_subset(dataset, num_samples, seed):
+    if num_samples >= len(dataset):
+        return dataset
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    indices = torch.randperm(len(dataset), generator=generator)[:num_samples].tolist()
+    return Subset(dataset, indices)
+
+
+def seed_everything(seed=3407):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def build_victim_pipeline(args, device):
+    classifier, classifier_name, victim_spec = build_imagenet_victim(args.classifier)
+    wrapper_config = build_wrapper_config_from_namespace(args, dataset="imagenet")
+    if wrapper_config.use_hira or wrapper_config.use_ranpac:
+        print("Preparing HiRA/RanPAC on the clean ImageNet training split before purifier construction.")
+    classifier, wrapped_name = apply_victim_wrappers(
         classifier,
-        "imagenet",
-        use_hira=args.use_hira_adapter,
-        hira_expansion_dim=args.hira_expansion_dim,
-        hira_num_blocks=args.hira_num_blocks,
-        hira_batch_size=args.hira_batch_size,
-        hira_num_workers=args.hira_num_workers,
-        hira_epochs=args.hira_epochs,
-        hira_lr=args.hira_lr,
-        hira_weight_decay=args.hira_weight_decay,
-        hira_seed=args.hira_seed,
-        hira_cache_dir=args.hira_cache_dir,
-        hira_dataset_root=args.hira_dataset_root,
-        hira_max_train_samples=args.hira_max_train_samples,
-        hira_force_retrain=args.hira_force_retrain,
-        adapt_noise_eps=args.adapt_noise_eps,
-        adapt_noise_num=args.adapt_noise_num,
-        adapt_alpha=args.adapt_alpha,
-        soft_threshold_alpha=args.soft_threshold_alpha,
-        soft_threshold_beta=args.soft_threshold_beta,
-        soft_threshold_stat_eps=args.soft_threshold_stat_eps,
-        soft_threshold_mode=args.soft_threshold_mode,
-        stability_ridge_gamma=args.stability_ridge_gamma,
-        stability_ridge_stat_eps=args.stability_ridge_stat_eps,
-        use_ranpac=args.use_ranpac_head,
-        ranpac_rp_dim=args.ranpac_rp_dim,
-        ranpac_batch_size=args.ranpac_batch_size,
-        ranpac_num_workers=args.ranpac_num_workers,
-        ranpac_seed=args.ranpac_seed,
-        ranpac_selection_method=args.ranpac_selection_method,
-        ranpac_lambda=args.ranpac_lambda,
-        ranpac_temp=args.ranpac_temp,
-        ranpac_hardneg_topk=args.ranpac_hardneg_topk,
-        ranpac_hardneg_gamma=args.ranpac_hardneg_gamma,
-        ranpac_cache_dir=args.ranpac_cache_dir,
-        ranpac_dataset_root=args.ranpac_dataset_root,
+        classifier_name=classifier_name,
+        supports_hira_arch=supports_hira(victim_spec),
+        config=wrapper_config,
         device=device,
     )
-    classifier = classifier.to(device)
-    classifier.eval()
+    classifier = classifier.to(device).eval()
+    return classifier, wrapped_name, victim_spec
 
-    dataset = get_dataset(
-        'imagenet', split='test', adv=False
+
+def evaluate_pipeline(args):
+    device = resolve_device(args.device)
+    seed_everything(args.seed)
+
+    classifier_variant = build_classifier_variant_name(args)
+    purifier_variant = build_purifier_variant_name(args)
+    save_path = os.path.join(
+        args.output_dir,
+        args.attack_method,
+        classifier_variant,
+        purifier_variant,
+        f"{args.num_validation_set}_samples",
     )
-    dataset = sample_eval_subset(dataset, args.num_validation_set, args.seed)
-    num_eval_samples = len(dataset)
+    os.makedirs(save_path, exist_ok=True)
+    wandb_run = init_wandb(args, save_path)
 
+    classifier, wrapped_classifier_name, victim_spec = build_victim_pipeline(args, device)
+    purifier = build_purifier(args, device)
+    purifier = purifier.to(device).eval()
+    purified_classifier = PurifiedClassifier(purifier, classifier).to(device).eval()
+
+    dataset = get_dataset("imagenet", split="test", adv=False)
+    dataset = sample_eval_subset(dataset, args.num_validation_set, args.seed)
     test_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=8)
 
-    model, diffusion = get_imagenet_dm_conf(device=device, respace=respace)
+    pgd_conf = gen_pgd_confs(eps=args.eps, alpha=1, iter=args.atk_iter, input_range=(0, 1))
+    attack = build_attack(args, classifier, purified_classifier, purifier, pgd_conf, device)
 
-    c = 0
-
-    controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-canny", torch_dtype=torch.float16)
-    pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
-        controlnet=controlnet,
-        torch_dtype=torch.float16,
-        safety_checker=None,
-        variant="fp16",
-    ).to(device, dtype=torch.float32)
-
-    # set scheduler
-    if args.model == "LCM":
-        pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
-    elif args.model == "TCD":
-        pipe.scheduler = TCDScheduler.from_config(pipe.scheduler.config)
-    else:
-        raise ValueError("model must be LCM")
-
-    # load LoRA layer and it's weight
-    if args.load_origin_lora:
-        if args.model == "LCM":
-            pipe.load_lora_weights("latent-consistency/lcm-lora-sdv1-5", adapter_name="origin_lora")
-            if args.lora_input_dir != None:
-                lora_state_dict = pipe.lora_state_dict(args.lora_input_dir)
-                unwrapped_state_dict = {}
-
-                for peft_key, weight in lora_state_dict[0].items():
-                    key = peft_key.replace("base_model.model.", "")
-                    unwrapped_state_dict[key] = weight.to(pipe.dtype)
-
-                pipe.load_lora_weights(unwrapped_state_dict, adapter_name="adv_lora")
-                pipe.set_adapters(["origin_lora", "adv_lora"], adapter_weights=[0.5, 0.5])
-        elif args.model == "TCD":
-            pipe.load_lora_weights("h1t/TCD-SD15-LoRA", adapter_name="origin_lora")
-        else:
-            raise ValueError("invalid model")
-    else:
-        lora_state_dict = pipe.lora_state_dict(args.lora_input_dir)
-        unwrapped_state_dict = {}
-
-        for peft_key, weight in lora_state_dict[0].items():
-            key = peft_key.replace("base_model.model.", "")
-            unwrapped_state_dict[key] = weight.to(pipe.dtype)
-
-        pipe.load_lora_weights(unwrapped_state_dict)
-
-    classifier_accuracy = 0
-    original_classifier_robust_accuracy = 0
-    robust_accuracy = 0
-    clean_accuracy = 0
-
-    clean_typical_accuracy = 0
-    typical_accuracy = 0
-
-    for subdir in (
-        "visualization",
-        "clean_image",
-        "robust_image",
-        "canny_image",
-        "adversarial_image",
-        "typical_image",
-    ):
-        os.makedirs(os.path.join(save_path, subdir), exist_ok=True)
-    
-    i = 1
+    raw_clean_correct = 0
+    raw_robust_correct = 0
+    purified_clean_correct = 0
+    purified_robust_correct = 0
 
     for x, y in tqdm(test_loader):
-        x, y = x.to(device), y.to(device)
+        x = x.to(device)
+        y = y.to(device)
 
-        classifier_accuracy += (y == classifier(x).argmax(1)).sum().item()
+        raw_clean_correct += (classifier(x).argmax(1) == y).sum().item()
+        purified_clean_correct += (purified_classifier(x).argmax(1) == y).sum().item()
 
-        x_adv_classifier = generate_x_adv(x, y, classifier, pgd_conf, device)
-        original_classifier_robust_accuracy += (y == classifier(x_adv_classifier).argmax(1)).sum().item()
+        x_adv = attack(x, y)
+        raw_robust_correct += (classifier(x_adv).argmax(1) == y).sum().item()
+        purified_robust_correct += (purified_classifier(x_adv).argmax(1) == y).sum().item()
 
-        if version == 'v1':
-            x_adv = x_adv_classifier
-        elif version == 'v2':
-            x_adv = generate_x_adv_denoised_v2(x, y, diffusion, model, classifier, pgd_conf, device, t, pipe)
-        else:
-            raise NotImplementedError(f"Unknown attack version: {version}")
-
-        with (torch.no_grad()):
-            net = Denoised_Classifier(classifier, pipe, device, diffusion, model, t)
-
-            denoised_clean_x, natual_canny = net.lcm_lora_denoise(x, pipe, device)
-            robust_x, adv_canny = net.lcm_lora_denoise(x_adv, pipe, device)
-        
-        si(x, save_path + f'/clean_image/{i}.png')
-        si(robust_x, save_path + f'/robust_image/{i}.png')
-        si(x_adv, save_path + f'/adversarial_image/{i}.png')
-        
-        clean_accuracy += (y == classifier(denoised_clean_x.to(torch.float32)).argmax(1)).sum().item()
-        robust_accuracy += (y == classifier(robust_x.to(torch.float32)).argmax(1)).sum().item()
-        i += 1
-
+    num_eval_samples = len(dataset)
     metrics = {
-        "classifier_accuracy": classifier_accuracy / num_eval_samples,
-        "original_classifier_robust_accuracy": original_classifier_robust_accuracy / num_eval_samples,
-        "attack_fail_rate": original_classifier_robust_accuracy / num_eval_samples,
-        "clean_accuracy": clean_accuracy / num_eval_samples,
-        "robust_accuracy": robust_accuracy / num_eval_samples,
-        "clean_typical_accuracy": clean_typical_accuracy / num_eval_samples,
-        "typical_accuracy": typical_accuracy / num_eval_samples,
-        "evaluated_examples": i - 1,
+        "victim_name": wrapped_classifier_name,
+        "victim_timm_model": victim_spec.timm_model_name,
+        "purifier_name": args.purifier_name,
+        "attack_method": args.attack_method,
+        "attack_target": args.attack_target,
+        "attack_version": args.attack_version,
+        "classifier_accuracy": raw_clean_correct / num_eval_samples,
+        "original_classifier_robust_accuracy": raw_robust_correct / num_eval_samples,
+        "attack_fail_rate": raw_robust_correct / num_eval_samples,
+        "clean_accuracy": purified_clean_correct / num_eval_samples,
+        "robust_accuracy": purified_robust_correct / num_eval_samples,
+        "evaluated_examples": num_eval_samples,
         "adapt_noise_eps": args.adapt_noise_eps,
         "adapt_noise_num": args.adapt_noise_num,
         "adapt_alpha": args.adapt_alpha,
@@ -656,8 +296,15 @@ def Global(classifier, device, respace, t, args, eps=16, iter=10, name='attack_g
         finish_wandb(wandb_run)
 
     print(stat)
+    return metrics
 
-if __name__ == '__main__':
+
+def Global(classifier, device, respace, t, args, eps=16, iter=10, name="attack_global", alpha=2, version="v1"):
+    del classifier, device, respace, t, eps, iter, name, alpha
+    args.attack_version = version
+    return evaluate_pipeline(args)
+
+
+if __name__ == "__main__":
     args = parse_args()
-    Global(args.classifier, args.device, 'ddim50', t=150, eps=args.eps, iter=args.atk_iter, name='attack_global_gradpass', alpha=1,                     #4/255 pgd-100 if want to run autoattack 4/255 just run this and add args.attack_method=AutoAttack
-                args=args, version=args.attack_version)
+    evaluate_pipeline(args)

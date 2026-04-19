@@ -1,17 +1,17 @@
 program: test.py
 method: grid
-project: instantpure-diffpgd
-name: imagenet-vit-swin-diffpgd-hira-ranpac
+project: instantpure-hira-ranpac-purification
+name: imagenet-purification-hira-ranpac
 metric:
   name: robust_accuracy
   goal: maximize
 parameters:
+  purifier_name:
+    value: instantpure
   model:
     value: LCM
   attack_method:
-    value: Linf_pgd
-  attack_version:
-    value: v2
+    value: diff_pgd
   output_dir:
     value: output
   lora_input_dir:
@@ -26,20 +26,34 @@ parameters:
     value: 1.0
   control_scale:
     value: 0.8
+  diffusion_respace:
+    value: ddim50
+  diffusion_timestep:
+    value: 150
   classifier:
-    values: [vit_base]
+    values:
+      - vit_small
+      - vit_tiny
+      - swin_b
+      - swin_s
   use_hira_adapter:
-    values: [false, true]
+    values: [true]
   hira_expansion_dim:
-    value: 32768
+    value: 16384
   use_ranpac_head:
-    values: [false, true]
+    values: [true]
   hira_num_blocks:
-    values: [2]
+    value: 4
   hira_batch_size:
-    value: 256
+    value: 128
   hira_num_workers:
-    value: 8
+    value: 4
+  hira_epochs:
+    value: 1
+  hira_lr:
+    value: 0.0001
+  hira_weight_decay:
+    value: 0.0001
   hira_seed:
     value: 0
   hira_cache_dir:
@@ -53,57 +67,62 @@ parameters:
   adapt_noise_eps:
     value: 0.0
   adapt_noise_num:
-    value: 0
+    value: 1
   adapt_alpha:
     value: 1.0
   soft_threshold_alpha:
-    values: [0.0, 0.1, 0.2, 0.35, 0.5]
+    value: 0.9
   soft_threshold_beta:
-    values: [2.0, 4.0, 8.0, 16.0]
+    value: 4.0
   soft_threshold_stat_eps:
     value: 1.0e-6
   soft_threshold_mode:
-    values: ["near_mean", "away_from_mean"]
+    value: away_from_mean
   stability_ridge_gamma:
-    values: [0.0, 0.5, 1.0]
+    value: 0.0
   stability_ridge_stat_eps:
     value: 1.0e-6
   ranpac_rp_dim:
-    value: 8192
+    value: 10000
+  ranpac_selection_method:
+    value: regression
   ranpac_lambda:
-    value: 1.0
+    value: 0.5
   ranpac_temp:
     value: 1.0
   ranpac_hardneg_topk:
-    value: 9
+    value: 0
   ranpac_hardneg_gamma:
-    value: 1.0
+    value: 0.0
   ranpac_batch_size:
-    value: 256
+    value: 64
   ranpac_num_workers:
-    value: 8
+    value: 4
   ranpac_seed:
     value: 0
+  ranpac_cache_dir:
+    value: pretrained/ranpac
   ranpac_dataset_root:
     value: ./dataset/imagenet
   device:
     value: "cuda:0"
   seed:
-    value: 3407
+    value: 0
   use_wandb:
     value: true
   wandb_project:
-    value: instantpure
+    value: instantpure-hira-ranpac
   wandb_group:
-    value: imagenet-vit-swin-diffpgd-hira-ranpac
+    value: imagenet-purification-hira-ranpac
   wandb_mode:
     value: online
   eps:
-    values: [8, 4]
+    values: [4]
   atk_iter:
-    values: [100]
+    value: 100
 command:
   - ${env}
   - ${interpreter}
   - ${program}
   - ${args}
+
