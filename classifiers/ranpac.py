@@ -49,17 +49,15 @@ class RanPACLinear(nn.Module):
 
 
 class ResidualRanPACLinear(nn.Module):
-    def __init__(self, original_linear, ranpac_linear, ranpac_lambda, ranpac_temp, baseline_logit_mean):
+    def __init__(self, original_linear, ranpac_linear, ranpac_lambda, ranpac_temp):
         super().__init__()
         self.original_linear = original_linear
         self.ranpac_linear = ranpac_linear
         self.ranpac_lambda = float(ranpac_lambda)
         self.ranpac_temp = float(ranpac_temp)
-        self.register_buffer("baseline_logit_mean", baseline_logit_mean.reshape(()))
 
     def forward(self, x):
         baseline_logits = self.original_linear(x)
-        baseline_logits = baseline_logits - self.baseline_logit_mean.to(dtype=baseline_logits.dtype)
         ranpac_logits = self.ranpac_linear(x) / self.ranpac_temp
         return (1 - self.ranpac_lambda) * baseline_logits + self.ranpac_lambda * ranpac_logits
 
@@ -410,10 +408,7 @@ def _collect_train_statistics(
     if logit_count == 0:
         raise ValueError("RanPAC train statistics loader is empty.")
 
-    baseline_logit_mean = torch.tensor(logit_sum / float(logit_count), dtype=torch.float32)
-
     return {
-        "baseline_logit_mean": baseline_logit_mean,
         "g_matrix": g_matrix,
         "q_matrix": q_matrix,
         "target_norm": target_norm,
@@ -481,7 +476,6 @@ def _fit_ranpac_state(
         accumulate_ridge_stats=True,
         collect_projected_stability_stats=is_stability_ridge_enabled(stability_ridge_gamma),
     )
-    baseline_logit_mean = train_stats["baseline_logit_mean"]
     g_train = train_stats["g_matrix"]
     q_train = train_stats["q_matrix"]
     stability_diagonal_prior = compute_stability_ridge_prior(
@@ -549,8 +543,6 @@ def _fit_ranpac_state(
         "adapt_alpha": adapt_alpha,
         "hardneg_topk": hardneg_topk,
         "hardneg_gamma": hardneg_gamma,
-        "baseline_logit_mean_source": "train_clean_global_scalar",
-        "baseline_logit_mean": baseline_logit_mean,
         "stability_ridge_enabled": is_stability_ridge_enabled(stability_ridge_gamma),
         "stability_ridge_gamma": stability_ridge_gamma,
         "stability_ridge_stat_eps": stability_ridge_stat_eps,
@@ -689,7 +681,6 @@ def apply_ranpac_head(
         ranpac_linear=ranpac_branch,
         ranpac_lambda=ranpac_lambda,
         ranpac_temp=ranpac_temp,
-        baseline_logit_mean=state["baseline_logit_mean"],
     )
     _set_module_by_name(model, layer_name, ranpac_head)
     return model

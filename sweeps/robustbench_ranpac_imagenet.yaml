@@ -1,6 +1,6 @@
 program: eval_robustbench_ranpac.py
 method: grid
-project: robustbench-ranpac-hira-rc-sweep_depth
+project: robustbench-ranpac-hira-rc-sweep_full_lambda
 name: robustbench-ranpac-hira-imagenet
 metric:
   name: robust_acc
@@ -16,6 +16,10 @@ parameters:
     value: ./robustbench_models
   model_names:
     values:
+      - Xu2024MIMIR_Swin-L 
+      - Xu2024MIMIR_Swin-B 
+      - Liu2023Comprehensive_Swin-L 
+      - Liu2023Comprehensive_Swin-B 
       - Singh2023Revisiting_ViT-B-ConvStem
       - Singh2023Revisiting_ViT-S-ConvStem
       - RodriguezMunoz2024Characterizing_Swin-L
@@ -87,7 +91,7 @@ parameters:
   ranpac_rp_dim:
     values: [10000]
   ranpac_lambda:
-    values: [.5]
+    values: [1.0]
   ranpac_temp:
     value: 1
   ranpac_hardneg_topk:

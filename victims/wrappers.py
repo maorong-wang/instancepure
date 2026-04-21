@@ -181,7 +181,7 @@ def apply_victim_wrappers(classifier, classifier_name, supports_hira_arch, confi
             hardneg_gamma=config.ranpac_hardneg_gamma,
         )
         wrapped_classifier_name = (
-            f"{wrapped_classifier_name}-ranpac-{config.ranpac_selection_method}-bbias"
+            f"{wrapped_classifier_name}-ranpac-{config.ranpac_selection_method}"
         )
         if config.ranpac_lambda != 1.0:
             wrapped_classifier_name = f"{wrapped_classifier_name}-lam{format_cache_value(config.ranpac_lambda)}"

@@ -889,8 +889,6 @@ def main():
                     ).to(device).eval()
                 model = freeze_backbone(model).to(device).eval()
                 benchmark_model_name = f"{model_name}-{variant_cfg['variant']}"
-                if variant_cfg["use_ranpac"]:
-                    benchmark_model_name = f"{benchmark_model_name}-bbias"
                 if variant_cfg["use_ranpac"] and args.ranpac_lambda != 1.0:
                     benchmark_model_name = f"{benchmark_model_name}-lam{str(args.ranpac_lambda).replace('/', '_')}"
                 if variant_cfg["use_ranpac"] and args.ranpac_temp != 1.0:
@@ -950,7 +948,7 @@ def main():
                         "ranpac_selection_method": variant_cfg["ranpac_selection_method"],
                         "ranpac_lambda": args.ranpac_lambda,
                         "ranpac_temp": args.ranpac_temp,
-                        "ranpac_baseline_bias_centered": variant_cfg["use_ranpac"],
+                        "ranpac_baseline_bias_centered": False,
                         "ranpac_hardneg_topk": args.ranpac_hardneg_topk,
                         "ranpac_hardneg_gamma": args.ranpac_hardneg_gamma,
                         "adapt_noise_eps": args.adapt_noise_eps,

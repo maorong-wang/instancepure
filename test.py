@@ -144,7 +144,7 @@ def build_classifier_variant_name(args):
         if args.hira_num_blocks != 2:
             classifier_variant = f"{classifier_variant}_blk{args.hira_num_blocks}"
     if args.use_ranpac_head:
-        classifier_variant = f"{classifier_variant}_ranpac_{args.ranpac_selection_method}_bbias"
+        classifier_variant = f"{classifier_variant}_ranpac_{args.ranpac_selection_method}"
         if args.ranpac_lambda != 1.0:
             classifier_variant = f"{classifier_variant}_lam{_format_variant_noise_value(args.ranpac_lambda)}"
         if args.ranpac_temp != 1.0:
@@ -282,7 +282,7 @@ def evaluate_pipeline(args):
         "soft_threshold_mode": args.soft_threshold_mode,
         "ranpac_lambda": args.ranpac_lambda,
         "ranpac_temp": args.ranpac_temp,
-        "ranpac_baseline_bias_centered": args.use_ranpac_head,
+        "ranpac_baseline_bias_centered": False,
         "ranpac_hardneg_topk": args.ranpac_hardneg_topk,
         "ranpac_hardneg_gamma": args.ranpac_hardneg_gamma,
     }
