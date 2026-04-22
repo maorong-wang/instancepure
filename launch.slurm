@@ -14,7 +14,7 @@
 source /home_fmg/maorong/miniconda3/etc/profile.d/conda.sh
 conda activate diffpure 
 
-SWEEP_ID="maorong-wang/robustbench-ranpac-hira-rc-sweep_full_lambda/5jyeq4n4"
+SWEEP_ID="maorong-wang/robustbench-ranpac-hira-rc-sweep_for_submission/04i9q7sv"
 
 echo "Job: $SLURM_JOB_ID  Array task: $SLURM_ARRAY_TASK_ID"
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"

@@ -1,6 +1,6 @@
 program: eval_robustbench_ranpac.py
 method: grid
-project: robustbench-ranpac-hira-rc-sweep_full_lambda
+project: robustbench-ranpac-hira-rc-sweep_for_submission
 name: robustbench-ranpac-hira-imagenet
 metric:
   name: robust_acc
@@ -91,7 +91,7 @@ parameters:
   ranpac_rp_dim:
     values: [10000]
   ranpac_lambda:
-    values: [1.0]
+    values: [0.5]
   ranpac_temp:
     value: 1
   ranpac_hardneg_topk:

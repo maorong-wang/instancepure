@@ -482,6 +482,7 @@ def evaluate_pgd(model, loader, device, norm, eps, steps, step_size, random_star
             predictions = model(adv_inputs).argmax(1)
         correct += (predictions == targets).sum().item()
         total += targets.size(0)
+        print(f"PGD: attacked {total-correct} samples within {total} sample")
     return correct / max(total, 1)
 
 
