@@ -64,6 +64,9 @@ class InstantPurePurifier(BasePurifier):
         else:
             raise ValueError("InstantPure purifier model must be one of: LCM, TCD.")
 
+        # Diffusers emits a per-call progress bar by default, which becomes noisy
+        # when purification runs once per ImageNet sample inside the eval loop.
+        pipe.set_progress_bar_config(disable=True)
         self._load_lora_weights(pipe)
         return pipe
 

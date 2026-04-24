@@ -1,44 +1,38 @@
 program: test.py
 method: grid
-project: instantpure-hira-ranpac-purification
-name: imagenet-purification-hira-ranpac
+project: mimicdiffusion-hira-ranpac-bpda-eot-pgd
+name: imagenet-purification-mimicdiffusion-bpda-eot-pgd-hira-ranpac
 metric:
   name: robust_accuracy
   goal: maximize
 parameters:
   purifier_name:
-    value: instantpure
-  model:
-    value: LCM
+    value: mimicdiffusion
   attack_method:
-    value: diff_pgd
+    value: bpda_eot_pgd
   output_dir:
     value: output
-  lora_input_dir:
-    value: pretrained/oscp_checkpoint/checkpoint-20000
   num_validation_set:
     value: 1000
-  num_inference_step:
-    value: 5
-  strength:
-    values: [0.2]
-  guidance_scale:
-    value: 1.0
-  control_scale:
-    value: 0.8
-  diffusion_respace:
-    value: ddim50
-  diffusion_timestep:
-    value: 150
+  batch_size:
+    value: 2
+  atk_iter:
+    value: 40
+  bpda_eot_iter:
+    value: 10
+  bpda_pgd_random_start:
+    value: false
+  bpda_pgd_step_size:
+    value: 0.0
   classifier:
     values:
       - vit_base
   use_hira_adapter:
-    values: [true]
+    values: [false]
   hira_expansion_dim:
     value: 16384
   use_ranpac_head:
-    values: [true]
+    values: [false]
   hira_num_blocks:
     value: 4
   hira_batch_size:
@@ -101,6 +95,24 @@ parameters:
     value: pretrained/ranpac
   ranpac_dataset_root:
     value: ./dataset/imagenet
+  guided_diffusion_pretrained_root:
+    value: /home_fmg/maorong/python/DiffPure/pretrained
+  guided_diffusion_use_fp16:
+    value: true
+  mimicdiffusion_max_timesteps:
+    value: "1000"
+  mimicdiffusion_num_denoising_steps:
+    value: "100"
+  mimicdiffusion_sampling_method:
+    value: ddpm
+  mimicdiffusion_rho_scale:
+    value: 3000.0
+  mimicdiffusion_guidance_start_step:
+    value: 20
+  mimicdiffusion_guidance_end_step:
+    value: 90
+  mimicdiffusion_projection_scale:
+    value: 4
   device:
     value: "cuda:0"
   seed:
@@ -108,17 +120,13 @@ parameters:
   use_wandb:
     value: true
   wandb_project:
-    value: instantpure-hira-ranpac
+    value: mimicdiffusion-hira-ranpac
   wandb_group:
-    value: imagenet-purification-hira-ranpac
+    value: imagenet-purification-mimicdiffusion-bpda-eot-pgd-hira-ranpac
   wandb_mode:
     value: online
   eps:
     values: [4]
-  atk_iter:
-    value: 30
-  batch_size:
-    value: 1
 command:
   - ${env}
   - ${interpreter}

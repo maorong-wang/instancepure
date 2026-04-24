@@ -1,7 +1,7 @@
 program: test.py
 method: grid
-project: instantpure-hira-ranpac-purification
-name: imagenet-purification-hira-ranpac
+project: instantpure-hira-ranpac-diffattack
+name: imagenet-purification-instantpure-diffattack-hira-ranpac
 metric:
   name: robust_accuracy
   goal: maximize
@@ -11,7 +11,7 @@ parameters:
   model:
     value: LCM
   attack_method:
-    value: diff_pgd
+    value: diffattack
   output_dir:
     value: output
   lora_input_dir:
@@ -30,9 +30,25 @@ parameters:
     value: ddim50
   diffusion_timestep:
     value: 150
+  diffattack_version:
+    value: rand
+  diffattack_n_iter:
+    value: 30
+  diffattack_n_restarts:
+    value: 1
+  diffattack_eot_iter:
+    value: 1
+  diffattack_rho:
+    value: 0.75
+  diffattack_t_interval:
+    value: 10
+  diffattack_use_trace_loss:
+    value: false
+  diffattack_trace_lambda:
+    value: 1.0
   classifier:
     values:
-      - vit_base
+      - swin_b
   use_hira_adapter:
     values: [true]
   hira_expansion_dim:
@@ -110,15 +126,13 @@ parameters:
   wandb_project:
     value: instantpure-hira-ranpac
   wandb_group:
-    value: imagenet-purification-hira-ranpac
+    value: imagenet-purification-instantpure-diffattack-hira-ranpac
   wandb_mode:
     value: online
   eps:
     values: [4]
-  atk_iter:
-    value: 30
   batch_size:
-    value: 1
+    value: 4
 command:
   - ${env}
   - ${interpreter}

@@ -1,7 +1,7 @@
 program: test.py
 method: grid
-project: instantpure-hira-ranpac-purification
-name: imagenet-purification-hira-ranpac
+project: instantpure-hira-ranpac-bpda-eot-pgd
+name: imagenet-purification-instantpure-bpda-eot-pgd-hira-ranpac
 metric:
   name: robust_accuracy
   goal: maximize
@@ -11,7 +11,7 @@ parameters:
   model:
     value: LCM
   attack_method:
-    value: diff_pgd
+    value: bpda_eot_pgd
   output_dir:
     value: output
   lora_input_dir:
@@ -30,15 +30,25 @@ parameters:
     value: ddim50
   diffusion_timestep:
     value: 150
+  batch_size:
+    value: 4
+  atk_iter:
+    value: 40
+  bpda_eot_iter:
+    value: 10
+  bpda_pgd_random_start:
+    value: false
+  bpda_pgd_step_size:
+    value: 0.0
   classifier:
     values:
       - vit_base
   use_hira_adapter:
-    values: [true]
+    values: [false]
   hira_expansion_dim:
     value: 16384
   use_ranpac_head:
-    values: [true]
+    values: [false]
   hira_num_blocks:
     value: 4
   hira_batch_size:
@@ -110,15 +120,11 @@ parameters:
   wandb_project:
     value: instantpure-hira-ranpac
   wandb_group:
-    value: imagenet-purification-hira-ranpac
+    value: imagenet-purification-instantpure-bpda-eot-pgd-hira-ranpac
   wandb_mode:
     value: online
   eps:
     values: [4]
-  atk_iter:
-    value: 30
-  batch_size:
-    value: 1
 command:
   - ${env}
   - ${interpreter}

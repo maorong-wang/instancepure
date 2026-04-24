@@ -23,6 +23,48 @@ def build_purifier(args, device):
         )
         return InstantPurePurifier(config, device=device)
 
+    if purifier_name == "diffpure":
+        from purifiers.diffpure import DiffPureConfig, DiffPurePurifier
+
+        config = DiffPureConfig(
+            diffusion_type=getattr(args, "diffpure_diffusion_type", "sde"),
+            sampling_method=getattr(args, "diffpure_sampling_method", "ddpm"),
+            sample_step=getattr(args, "diffpure_sample_step", 1),
+            timestep=getattr(args, "diffpure_t", 150),
+            rand_t=getattr(args, "diffpure_rand_t", False),
+            t_delta=getattr(args, "diffpure_t_delta", 15),
+            use_brownian=getattr(args, "diffpure_use_brownian", False),
+            pretrained_root=getattr(
+                args,
+                "guided_diffusion_pretrained_root",
+                "/home_fmg/maorong/python/DiffPure/pretrained",
+            ),
+            checkpoint_path=getattr(args, "guided_diffusion_checkpoint_path", None),
+            use_fp16=getattr(args, "guided_diffusion_use_fp16", False),
+        )
+        return DiffPurePurifier(config, device=device)
+
+    if purifier_name == "mimicdiffusion":
+        from purifiers.mimicdiffusion import MimicDiffusionConfig, MimicDiffusionPurifier
+
+        config = MimicDiffusionConfig(
+            max_timesteps=getattr(args, "mimicdiffusion_max_timesteps", "1000"),
+            num_denoising_steps=getattr(args, "mimicdiffusion_num_denoising_steps", "100"),
+            sampling_method=getattr(args, "mimicdiffusion_sampling_method", "ddpm"),
+            rho_scale=getattr(args, "mimicdiffusion_rho_scale", 3000.0),
+            guidance_start_step=getattr(args, "mimicdiffusion_guidance_start_step", 20),
+            guidance_end_step=getattr(args, "mimicdiffusion_guidance_end_step", 90),
+            projection_scale=getattr(args, "mimicdiffusion_projection_scale", 4),
+            pretrained_root=getattr(
+                args,
+                "guided_diffusion_pretrained_root",
+                "/home_fmg/maorong/python/DiffPure/pretrained",
+            ),
+            checkpoint_path=getattr(args, "guided_diffusion_checkpoint_path", None),
+            use_fp16=getattr(args, "guided_diffusion_use_fp16", False),
+        )
+        return MimicDiffusionPurifier(config, device=device)
+
     if purifier_name in {"instancepure", "puriflow"}:
         raise NotImplementedError(
             f"Purifier '{purifier_name}' is not wired in this repository yet. "
