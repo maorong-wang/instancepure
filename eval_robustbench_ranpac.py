@@ -125,6 +125,13 @@ def parse_args():
         help="Threat model used to load the RobustBench model.",
     )
     parser.add_argument(
+        "--attack-threat-model",
+        "--attack_threat_model",
+        default="",
+        choices=["", ThreatModel.Linf.value, ThreatModel.L2.value],
+        help="Optional threat model used only for attacks. Leave empty to attack in the model's native norm.",
+    )
+    parser.add_argument(
         "--data-dir",
         "--data_dir",
         required=True,
@@ -349,6 +356,10 @@ def default_pgd_step_size(eps, steps):
     return 2.0 * eps / max(steps, 1)
 
 
+def resolve_attack_threat_model(args):
+    return args.attack_threat_model or args.threat_model
+
+
 def build_dataset(dataset, split, data_dir, transform):
     if dataset == BenchmarkDataset.cifar_10.value:
         return torchvision.datasets.CIFAR10(
@@ -488,6 +499,13 @@ def evaluate_pgd(model, loader, device, norm, eps, steps, step_size, random_star
 
 def evaluate_autoattack_benchmark(model, benchmark_model_name, args, eps, device, preprocessing):
     model.eval()
+    attack_threat_model = resolve_attack_threat_model(args)
+    if attack_threat_model != args.threat_model:
+        raise ValueError(
+            "Official RobustBench standard AutoAttack cannot be used when the attack norm differs "
+            f"from the model threat model ({args.threat_model} vs {attack_threat_model}). "
+            "Use a local AutoAttack version such as --autoattack_version full or rand."
+        )
     if args.autoattack_eot_iter != 1:
         print(
             "RobustBench benchmark() uses standard AutoAttack and does not expose the "
@@ -647,7 +665,7 @@ def evaluate_autoattack_custom(model, loader, device, norm, eps, version, eot_it
         adversary.apgd.n_restarts = 1
         adversary.apgd.eot_iter = eot_iter
     elif version == "full":
-        adversary.attacks_to_run = ["apgd-ce", "apgd-dlr", "fab", "square"]
+        adversary.attacks_to_run = ["apgd-ce", "apgd-t", "fab-t", "square"]
     elif version == "apgdt":
         adversary.attacks_to_run = ["apgd-t"]
         if norm in {"Linf", "L2"}:
@@ -678,6 +696,7 @@ def load_robustbench_model(model_name, dataset, threat_model, model_dir, device)
 
 def evaluate_variant(model, variant_name, benchmark_model_name, loader, attacks, args, eps, pgd_step_size, device, preprocessing):
     metrics = {"variant": variant_name}
+    attack_threat_model = resolve_attack_threat_model(args)
     if "autoattack" in attacks:
         autoattack_version = args.autoattack_version.lower()
         if autoattack_version in OFFICIAL_AUTOATTACK_VERSIONS:
@@ -694,7 +713,7 @@ def evaluate_variant(model, variant_name, benchmark_model_name, loader, attacks,
                 model,
                 loader,
                 device,
-                norm=args.threat_model,
+                norm=attack_threat_model,
                 eps=eps,
                 version=autoattack_version,
                 eot_iter=args.autoattack_eot_iter,
@@ -715,7 +734,7 @@ def evaluate_variant(model, variant_name, benchmark_model_name, loader, attacks,
             model,
             loader,
             device,
-            norm=args.threat_model,
+            norm=attack_threat_model,
             eps=eps,
             steps=args.pgd_steps,
             step_size=pgd_step_size,
@@ -772,7 +791,8 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     device = resolve_device(args.device)
-    eps = args.eps if args.eps is not None else default_eps(args.dataset, args.threat_model)
+    attack_threat_model = resolve_attack_threat_model(args)
+    eps = args.eps if args.eps is not None else default_eps(args.dataset, attack_threat_model)
     pgd_step_size = args.pgd_step_size if args.pgd_step_size is not None else default_pgd_step_size(eps, args.pgd_steps)
     attacks = resolve_attacks(args)
     variants = resolve_variants(args)
@@ -785,7 +805,10 @@ def main():
         results = []
         step = 0
         for model_name in args.model_names:
-            print(f"Evaluating {model_name} on {args.dataset} ({args.threat_model}), eps={eps}")
+            print(
+                f"Evaluating {model_name} on {args.dataset} "
+                f"(model={args.threat_model}, attack={attack_threat_model}), eps={eps}"
+            )
             model_preprocessing = resolve_model_preprocessing(args.dataset, args.threat_model, model_name)
             eval_loader = build_eval_loader(
                 dataset=args.dataset,
@@ -940,6 +963,7 @@ def main():
                         "model_name": model_name,
                         "dataset": args.dataset,
                         "threat_model": args.threat_model,
+                        "attack_threat_model": attack_threat_model,
                         "eps": eps,
                         "eval_examples": eval_examples,
                         "attack_method": args.attack_method or args.attacks,
