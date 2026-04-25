@@ -56,7 +56,7 @@ def parse_args():
     parser.add_argument("--soft_threshold_mode", type=str, choices=["near_mean", "away_from_mean"], default="away_from_mean", help="HiRA-only inference sparsification target: pull ambiguous hidden features toward the mean or toward the nearest mean +/- alpha*std boundary.")
     parser.add_argument("--stability_ridge_gamma", type=float, default=0.0, help="Strength of the stability-aware diagonal ridge prior; 0 disables it.")
     parser.add_argument("--stability_ridge_stat_eps", type=float, default=DEFAULT_STABILITY_RIDGE_STAT_EPS, help="Minimum projected-feature std used by the stability-aware ridge prior.")
-    parser.add_argument("--attack_method", default="Linf_pgd", type=str, help="Attack backend. `diff_pgd`, `diffattack`, `diffhammer`, `bpda_eot_pgd`, and `bpda_eot_aa` are purifier-targeted attacks; standard attacks hit the selected attack target.")
+    parser.add_argument("--attack_method", default="Linf_pgd", type=str, help="Attack backend. `diff_pgd`, `diffattack`, `diffhammer`, and `bpda_eot_pgd` are purifier-targeted adaptive attacks. `purifier_pgd` and `purifier_aa` match the original PGD / AutoAttack evaluation flow: attack the raw victim first, then report purified robustness on the adversarial image. Standard attacks hit the selected attack target.")
     parser.add_argument("--attack_target", choices=["victim", "purified"], default="victim", help="Which composed model standard attacks should target.")
     parser.add_argument("--device", default="cuda:0", help="Device, e.g. cuda:0")
     parser.add_argument("--use_ranpac_head", "--use_ranpac", type=str2bool, default=False, help="Replace the final linear layer with a RanPAC ridge head.")
@@ -72,7 +72,7 @@ def parse_args():
     parser.add_argument("--ranpac_cache_dir", type=str, default="pretrained/ranpac", help="Cache directory for fitted RanPAC heads.")
     parser.add_argument("--ranpac_dataset_root", type=str, default=None, help="ImageNet root used when fitting a RanPAC head.")
     parser.add_argument("--stadv_num_iterations", type=int, default=100, help="Number of optimization steps for the DiffPure stadv attack.")
-    parser.add_argument("--stadv_eot_iter", type=int, default=20, help="EOT iterations for the DiffPure stadv attack.")
+    parser.add_argument("--stadv_eot_iter", type=int, default=5, help="EOT iterations for the DiffPure stadv attack.")
     parser.add_argument("--use_wandb", type=str2bool, default=False, help="Log final metrics to Weights & Biases.")
     parser.add_argument("--wandb_project", type=str, default="instantpure", help="Weights & Biases project name.")
     parser.add_argument("--wandb_entity", type=str, default="", help="Weights & Biases entity.")
@@ -106,7 +106,7 @@ def parse_args():
     parser.add_argument("--diffattack_attacks_to_run", type=str, default="", help="Comma-separated DiffAttack attack list used only with --diffattack_version custom. Supported entries here are apgd-ce and apgd-dlr.")
     parser.add_argument("--diffattack_n_iter", type=int, default=100, help="Number of APGD steps per DiffAttack run.")
     parser.add_argument("--diffattack_n_restarts", type=int, default=5, help="Number of DiffAttack APGD restarts.")
-    parser.add_argument("--diffattack_eot_iter", type=int, default=1, help="EOT iterations for DiffAttack. This repository defaults to 1 for efficiency, even though the original ImageNet rand setup used 20.")
+    parser.add_argument("--diffattack_eot_iter", type=int, default=5, help="EOT iterations for DiffAttack.")
     parser.add_argument("--diffattack_rho", type=float, default=0.75, help="APGD step-size reduction parameter used by DiffAttack.")
     parser.add_argument("--diffattack_t_interval", type=int, default=10, help="Trajectory sampling interval for the DiffAttack diffusion-trace MSE term.")
     parser.add_argument("--diffattack_use_trace_loss", type=str2bool, default=True, help="Use the DiffAttack trajectory-matching loss when the purifier exposes a trace API.")
@@ -117,7 +117,7 @@ def parse_args():
     parser.add_argument("--diffhammer_loss_names", type=str, default="CW,CE,DLR", help="Comma-separated DiffHammer loss schedule aligned with restarts.")
     parser.add_argument("--diffhammer_n_restart", type=int, default=3, help="Number of DiffHammer restarts.")
     parser.add_argument("--diffhammer_n_eval", type=int, default=10, help="Number of DiffHammer evaluation seeds used to score candidate adversarial examples.")
-    parser.add_argument("--diffhammer_n_eot", type=int, default=1, help="Number of DiffHammer attack-time EOT seeds per update.")
+    parser.add_argument("--diffhammer_n_eot", type=int, default=5, help="Number of DiffHammer attack-time EOT seeds per update.")
     parser.add_argument("--diffhammer_grad_mode", type=str, choices=["bpda", "full"], default="bpda", help="DiffHammer gradient mode. This repository currently executes the attack through BPDA over the purifier.")
     parser.add_argument("--diffhammer_pgd_cmd", type=str, default="", help="Optional DiffHammer PGD modifiers. `M` enables momentum and `T` enables blur smoothing.")
     parser.add_argument("--diffhammer_pgd_step_size", type=float, default=0.0, help="Explicit DiffHammer PGD step size. A repository-style default is used when this is 0.")
@@ -125,11 +125,13 @@ def parse_args():
     parser.add_argument("--diffhammer_em_alpha", type=float, default=0.5, help="DiffHammer EM moving-average exponent.")
     parser.add_argument("--diffhammer_em_lam", type=float, default=5.0, help="DiffHammer EM weighting sharpness.")
     parser.add_argument("--diffhammer_em_steps", type=int, default=5, help="Number of EM refinement steps used by DiffHammer.")
-    parser.add_argument("--bpda_eot_iter", type=int, default=10, help="EOT iterations used by the purifier-targeted BPDA+EOT PGD and AutoAttack attacks.")
-    parser.add_argument("--bpda_pgd_random_start", type=str2bool, default=False, help="Enable random-start Linf PGD for the purifier-targeted BPDA+EOT PGD attack.")
-    parser.add_argument("--bpda_pgd_step_size", type=float, default=0.0, help="Optional BPDA+EOT PGD step size in pixel units out of 255. The repository PGD alpha is used when this is 0.")
-    parser.add_argument("--bpda_aa_version", type=str, choices=["rand", "full", "apgdt"], default="rand", help="Local AutoAttack kernel used by the purifier-targeted BPDA+EOT AutoAttack attack.")
-    parser.add_argument("--bpda_aa_n_iter", type=int, default=40, help="Iteration cap applied to the APGD components inside the purifier-targeted BPDA+EOT AutoAttack attack.")
+    parser.add_argument("--bpda_eot_iter", type=int, default=5, help="Number of EOT purifier seeds averaged per BPDA update for `bpda_eot_pgd`.")
+    parser.add_argument("--bpda_pgd_random_start", type=str2bool, default=False, help="Enable random-start Linf PGD for the BPDA+EOT purifier attack `bpda_eot_pgd`.")
+    parser.add_argument("--bpda_pgd_step_size", type=float, default=0.0, help="Optional PGD step size in pixel units out of 255 for `bpda_eot_pgd`. The repository PGD alpha is used when this is 0.")
+    parser.add_argument("--purifier_pgd_random_start", type=str2bool, default=False, help="Enable random-start Linf PGD for the original-style raw-victim `purifier_pgd` attack.")
+    parser.add_argument("--purifier_pgd_step_size", type=float, default=0.0, help="Optional PGD step size in pixel units out of 255 for the original-style raw-victim `purifier_pgd` attack. The repository PGD alpha is used when this is 0.")
+    parser.add_argument("--purifier_aa_version", type=str, choices=["rand", "full", "apgdt"], default="rand", help="Local AutoAttack kernel used by the original-style raw-victim `purifier_aa` attack.")
+    parser.add_argument("--purifier_aa_n_iter", type=int, default=100, help="Iteration cap applied to the APGD components inside the original-style raw-victim `purifier_aa` attack.")
     return parser.parse_args()
 
 
@@ -362,8 +364,8 @@ def evaluate_pipeline(args):
         "victim_timm_model": victim_spec.timm_model_name,
         "purifier_name": args.purifier_name,
         "attack_method": args.attack_method,
-        "attack_eot_iter": getattr(attack, "eot_iter", 1),
-        "attack_eval_eot_iter": getattr(attack, "eval_eot_iter", 1),
+        "attack_eot_iter": getattr(attack, "eot_iter", None),
+        "attack_eval_eot_iter": getattr(attack, "eval_eot_iter", None),
         "attack_target": args.attack_target,
         "attack_version": args.attack_version,
         "batch_size": args.batch_size,
@@ -440,14 +442,16 @@ def evaluate_pipeline(args):
         "diffhammer_effective_n_eval": getattr(getattr(attack, "runtime_config", None), "n_eval", args.diffhammer_n_eval),
         "diffhammer_effective_n_eot": getattr(getattr(attack, "runtime_config", None), "n_eot", args.diffhammer_n_eot),
         "diffhammer_effective_em": getattr(getattr(attack, "runtime_config", None), "em", args.diffhammer_em),
-        "bpda_eot_iter": args.bpda_eot_iter,
-        "bpda_pgd_random_start": args.bpda_pgd_random_start,
-        "bpda_pgd_step_size": args.bpda_pgd_step_size,
-        "bpda_aa_version": args.bpda_aa_version,
-        "bpda_aa_n_iter": args.bpda_aa_n_iter,
-        "bpda_aa_effective_version": getattr(getattr(attack, "runtime_config", None), "aa_version", args.bpda_aa_version),
-        "bpda_aa_effective_n_iter": getattr(getattr(attack, "runtime_config", None), "n_iter", args.bpda_aa_n_iter),
-        "bpda_aa_effective_attacks_to_run": getattr(getattr(attack, "runtime_config", None), "attacks_to_run", ""),
+        "bpda_eot_iter": getattr(getattr(attack, "runtime_config", None), "eot_iter", None),
+        "bpda_pgd_random_start": getattr(getattr(attack, "runtime_config", None), "random_start", None),
+        "bpda_pgd_step_size": getattr(getattr(attack, "runtime_config", None), "step_size", None),
+        "purifier_pgd_random_start": args.purifier_pgd_random_start,
+        "purifier_pgd_step_size": args.purifier_pgd_step_size,
+        "purifier_aa_version": args.purifier_aa_version,
+        "purifier_aa_n_iter": args.purifier_aa_n_iter,
+        "purifier_aa_effective_version": getattr(getattr(attack, "runtime_config", None), "aa_version", args.purifier_aa_version),
+        "purifier_aa_effective_n_iter": getattr(getattr(attack, "runtime_config", None), "n_iter", args.purifier_aa_n_iter),
+        "purifier_aa_effective_attacks_to_run": getattr(getattr(attack, "runtime_config", None), "attacks_to_run", ""),
     }
 
     stat = pd.DataFrame(metrics, index=[0])

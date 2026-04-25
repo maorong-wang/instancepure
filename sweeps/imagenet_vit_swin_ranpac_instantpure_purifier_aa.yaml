@@ -1,51 +1,45 @@
 program: test.py
 method: grid
-project: diffpure-hira-ranpac-diffhammer
-name: imagenet-purification-diffpure-diffhammer-hira-ranpac
+project: instantpure-hira-ranpac-purifier-aa
+name: imagenet-purification-instantpure-purifier-aa-hira-ranpac
 metric:
   name: robust_accuracy
   goal: maximize
 parameters:
   purifier_name:
-    value: diffpure
+    value: instantpure
+  model:
+    value: LCM
   attack_method:
-    value: diffhammer
+    value: purifier_aa
   output_dir:
     value: output
+  lora_input_dir:
+    value: pretrained/oscp_checkpoint/checkpoint-20000
   num_validation_set:
     value: 1000
+  num_inference_step:
+    value: 5
+  strength:
+    values: [0.2]
+  guidance_scale:
+    value: 1.0
+  control_scale:
+    value: 0.8
+  diffusion_respace:
+    value: ddim50
+  diffusion_timestep:
+    value: 150
   batch_size:
-    value: 2
-  diffhammer_preset:
-    value: default
-  diffhammer_method:
-    value: apgd
-  diffhammer_n_iters:
-    value: "30,30,30"
-  diffhammer_loss_names:
-    value: "CW,CE,DLR"
-  diffhammer_n_restart:
-    value: 3
-  diffhammer_n_eval:
-    value: 1
-  diffhammer_n_eot:
-    value: 5
-  diffhammer_grad_mode:
-    value: bpda
-  diffhammer_em:
-    value: false
-  diffhammer_em_alpha:
-    value: 0.5
-  diffhammer_em_lam:
-    value: 5.0
-  diffhammer_em_steps:
-    value: 5
+    value: 4
+  purifier_aa_version:
+    value: rand
+  purifier_aa_n_iter:
+    value: 100
   classifier:
     values:
       - vit_small
-      - vit_tiny
-      - swin_b
-      - swin_s
+      - vit_base
   use_hira_adapter:
     values: [true]
   hira_expansion_dim:
@@ -114,24 +108,6 @@ parameters:
     value: pretrained/ranpac
   ranpac_dataset_root:
     value: ./dataset/imagenet
-  guided_diffusion_pretrained_root:
-    value: /home_fmg/maorong/python/DiffPure/pretrained
-  guided_diffusion_use_fp16:
-    value: true
-  diffpure_diffusion_type:
-    value: sde
-  diffpure_sampling_method:
-    value: ddpm
-  diffpure_sample_step:
-    value: 1
-  diffpure_t:
-    value: 150
-  diffpure_rand_t:
-    value: false
-  diffpure_t_delta:
-    value: 15
-  diffpure_use_brownian:
-    value: false
   device:
     value: "cuda:0"
   seed:
@@ -139,9 +115,9 @@ parameters:
   use_wandb:
     value: true
   wandb_project:
-    value: diffpure-hira-ranpac
+    value: instantpure-hira-ranpac
   wandb_group:
-    value: imagenet-purification-diffpure-diffhammer-hira-ranpac
+    value: imagenet-purification-instantpure-purifier-aa-hira-ranpac
   wandb_mode:
     value: online
   eps:

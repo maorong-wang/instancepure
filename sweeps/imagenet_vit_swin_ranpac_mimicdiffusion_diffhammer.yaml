@@ -29,7 +29,7 @@ parameters:
   diffhammer_n_eval:
     value: 1
   diffhammer_n_eot:
-    value: 1
+    value: 5
   diffhammer_grad_mode:
     value: bpda
   diffhammer_em:

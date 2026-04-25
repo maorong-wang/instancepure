@@ -14,7 +14,7 @@
 source /home_fmg/maorong/miniconda3/etc/profile.d/conda.sh
 conda activate diffpure 
 
-SWEEP_ID="maorong-wang/mimicdiffusion-hira-ranpac-purification/cumipi0s"
+SWEEP_ID="maorong-wang/mimicdiffusion-hira-ranpac-purification/gvrwljbo"
 
 echo "Job: $SLURM_JOB_ID  Array task: $SLURM_ARRAY_TASK_ID"
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"

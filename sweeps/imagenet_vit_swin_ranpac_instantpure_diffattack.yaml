@@ -37,7 +37,7 @@ parameters:
   diffattack_n_restarts:
     value: 1
   diffattack_eot_iter:
-    value: 1
+    value: 5
   diffattack_rho:
     value: 0.75
   diffattack_t_interval:

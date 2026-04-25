@@ -144,7 +144,7 @@ class InstantPurePurifier(BasePurifier):
             sample = (sample + 1) / 2
         return sample
 
-    def purify(self, x):
+    def purify(self, x, seed=None):
         batch = x.shape[0]
         prompt = ["" for _ in range(batch)]
         original_size = x.size(-1)
@@ -155,9 +155,10 @@ class InstantPurePurifier(BasePurifier):
         image_input = torch.clamp(image_input, 0, 1)
         control_images = self._build_control_images(image_input)
         generators = []
+        base_seed = self.config.seed if seed is None else int(seed)
         for index in range(batch):
             generator = torch.Generator(device="cpu")
-            generator.manual_seed(self.config.seed + index)
+            generator.manual_seed(base_seed + index)
             generators.append(generator)
         image = self.pipe(
             prompt=prompt,

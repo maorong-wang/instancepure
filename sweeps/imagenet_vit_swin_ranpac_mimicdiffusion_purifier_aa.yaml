@@ -1,7 +1,7 @@
 program: test.py
 method: grid
-project: mimicdiffusion-hira-ranpac-bpda-eot-aa
-name: imagenet-purification-mimicdiffusion-bpda-eot-aa-hira-ranpac
+project: mimicdiffusion-hira-ranpac-purifier-aa
+name: imagenet-purification-mimicdiffusion-purifier-aa-hira-ranpac
 metric:
   name: robust_accuracy
   goal: maximize
@@ -9,28 +9,27 @@ parameters:
   purifier_name:
     value: mimicdiffusion
   attack_method:
-    value: bpda_eot_aa
+    value: purifier_aa
   output_dir:
     value: output
   num_validation_set:
     value: 1000
   batch_size:
     value: 2
-  bpda_eot_iter:
-    value: 10
-  bpda_aa_version:
+  purifier_aa_version:
     value: rand
-  bpda_aa_n_iter:
-    value: 40
+  purifier_aa_n_iter:
+    value: 100
   classifier:
     values:
       - vit_base
+      - vit_small
   use_hira_adapter:
-    values: [false]
+    values: [true]
   hira_expansion_dim:
     value: 16384
   use_ranpac_head:
-    values: [false]
+    values: [true]
   hira_num_blocks:
     value: 4
   hira_batch_size:
@@ -120,7 +119,7 @@ parameters:
   wandb_project:
     value: mimicdiffusion-hira-ranpac
   wandb_group:
-    value: imagenet-purification-mimicdiffusion-bpda-eot-aa-hira-ranpac
+    value: imagenet-purification-mimicdiffusion-purifier-aa-hira-ranpac
   wandb_mode:
     value: online
   eps:

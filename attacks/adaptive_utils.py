@@ -1,3 +1,4 @@
+import inspect
 from contextlib import contextmanager
 
 import torch
@@ -92,6 +93,19 @@ def build_loss_fn(loss_name):
 
 def purifier_forward(purifier, x, seed=None):
     normalized_seed = _normalize_seed_spec(seed)
+
+    def _call_purifier(module, batch, item_seed):
+        if hasattr(module, "purify"):
+            purify_fn = module.purify
+            try:
+                parameters = inspect.signature(purify_fn).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            if "seed" in parameters:
+                return purify_fn(batch, seed=item_seed)
+            return purify_fn(batch)
+        return module(batch)
+
     if isinstance(normalized_seed, list):
         if len(normalized_seed) != x.shape[0]:
             raise ValueError(
@@ -100,16 +114,11 @@ def purifier_forward(purifier, x, seed=None):
         outputs = []
         for index, item_seed in enumerate(normalized_seed):
             with forked_seed(item_seed, x.device):
-                if hasattr(purifier, "purify"):
-                    outputs.append(purifier.purify(x[index : index + 1]))
-                else:
-                    outputs.append(purifier(x[index : index + 1]))
+                outputs.append(_call_purifier(purifier, x[index : index + 1], item_seed))
         return torch.cat(outputs, dim=0)
 
     with forked_seed(normalized_seed, x.device):
-        if hasattr(purifier, "purify"):
-            return purifier.purify(x)
-        return purifier(x)
+        return _call_purifier(purifier, x, normalized_seed)
 
 
 def bpda_gradient(purifier, classifier, x, y, loss_fn, seed=None, external_grad=None):

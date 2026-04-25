@@ -658,7 +658,7 @@ def evaluate_autoattack_custom(model, loader, device, norm, eps, version, eot_it
 
     model.eval()
     clean_inputs, clean_targets = _loader_to_tensors(loader, desc=f"{desc}_materialize")
-    adversary = AutoAttack(model, norm=norm, eps=eps, version="custom", device=device, verbose=False)
+    adversary = AutoAttack(model, norm=norm, eps=eps, version="custom", device=device, verbose=True)
 
     if version == "rand":
         adversary.attacks_to_run = ["apgd-ce", "apgd-dlr"]

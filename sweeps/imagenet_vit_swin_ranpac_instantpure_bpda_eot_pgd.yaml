@@ -35,7 +35,7 @@ parameters:
   atk_iter:
     value: 40
   bpda_eot_iter:
-    value: 10
+    value: 5
   bpda_pgd_random_start:
     value: false
   bpda_pgd_step_size:
@@ -44,11 +44,11 @@ parameters:
     values:
       - vit_base
   use_hira_adapter:
-    values: [false]
+    values: [true]
+  use_ranpac_head:
+    values: [true]
   hira_expansion_dim:
     value: 16384
-  use_ranpac_head:
-    values: [false]
   hira_num_blocks:
     value: 4
   hira_batch_size:
