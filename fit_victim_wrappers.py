@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument("--soft_threshold_beta", type=float, default=8.0, help="HiRA-only sharpness of the smooth mean-centered threshold.")
     parser.add_argument("--soft_threshold_stat_eps", type=float, default=1e-6, help="HiRA-only minimum hidden-feature std used by the smooth mean-centered threshold.")
     parser.add_argument("--soft_threshold_mode", type=str, choices=["near_mean", "away_from_mean"], default="away_from_mean", help="HiRA-only inference sparsification target.")
+    parser.add_argument("--hira_subspace_rank", type=int, default=0, help="HiRA-only clean projected-feature subspace rank; 0 disables clean-subspace calibration.")
+    parser.add_argument("--hira_subspace_shrink", type=float, default=1.0, help="HiRA-only shrinkage applied to the residual orthogonal to the clean projected-feature subspace. 1 keeps the residual unchanged.")
     parser.add_argument("--stability_ridge_gamma", type=float, default=0.0, help="Strength of the stability-aware diagonal ridge prior; 0 disables it.")
     parser.add_argument("--stability_ridge_stat_eps", type=float, default=DEFAULT_STABILITY_RIDGE_STAT_EPS, help="Minimum projected-feature std used by the stability-aware ridge prior.")
     parser.add_argument("--use_ranpac_head", "--use_ranpac", type=str2bool, default=False, help="Replace the final linear layer with a RanPAC ridge head.")

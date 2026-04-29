@@ -54,6 +54,8 @@ def parse_args():
     parser.add_argument("--soft_threshold_beta", type=float, default=8.0, help="HiRA-only sharpness of the smooth mean-centered threshold.")
     parser.add_argument("--soft_threshold_stat_eps", type=float, default=1e-6, help="HiRA-only minimum hidden-feature std used by the smooth mean-centered threshold.")
     parser.add_argument("--soft_threshold_mode", type=str, choices=["near_mean", "away_from_mean"], default="away_from_mean", help="HiRA-only inference sparsification target: pull ambiguous hidden features toward the mean or toward the nearest mean +/- alpha*std boundary.")
+    parser.add_argument("--hira_subspace_rank", type=int, default=0, help="HiRA-only clean projected-feature subspace rank; 0 disables clean-subspace calibration.")
+    parser.add_argument("--hira_subspace_shrink", type=float, default=1.0, help="HiRA-only shrinkage applied to the residual orthogonal to the clean projected-feature subspace. 1 keeps the residual unchanged.")
     parser.add_argument("--stability_ridge_gamma", type=float, default=0.0, help="Strength of the stability-aware diagonal ridge prior; 0 disables it.")
     parser.add_argument("--stability_ridge_stat_eps", type=float, default=DEFAULT_STABILITY_RIDGE_STAT_EPS, help="Minimum projected-feature std used by the stability-aware ridge prior.")
     parser.add_argument("--attack_method", default="Linf_pgd", type=str, help="Attack backend. `diff_pgd`, `diffattack`, `diffhammer`, and `bpda_eot_pgd` are purifier-targeted adaptive attacks. `purifier_pgd` and `purifier_aa` match the original PGD / AutoAttack evaluation flow: attack the raw victim first, then report purified robustness on the adversarial image. Standard attacks hit the selected attack target.")
@@ -183,10 +185,20 @@ def build_stability_ridge_variant_tag(args):
     )
 
 
+def build_hira_subspace_variant_tag(args):
+    if args.hira_subspace_rank <= 0:
+        return ""
+    tag = f"_subr{args.hira_subspace_rank}"
+    if args.hira_subspace_shrink != 1.0:
+        tag = f"{tag}_subs{_format_variant_noise_value(args.hira_subspace_shrink)}"
+    return tag
+
+
 def build_classifier_variant_name(args):
     classifier_variant = args.classifier
     adapt_noise_tag = build_adapt_noise_tag(args)
     meansparse_tag = build_meansparse_tag(args)
+    subspace_tag = build_hira_subspace_variant_tag(args)
     stability_ridge_tag = build_stability_ridge_variant_tag(args)
     if args.use_hira_adapter:
         classifier_variant = f"{classifier_variant}_hira"
@@ -207,6 +219,8 @@ def build_classifier_variant_name(args):
         classifier_variant = f"{classifier_variant}{adapt_noise_tag}"
     if meansparse_tag and args.use_hira_adapter:
         classifier_variant = f"{classifier_variant}{meansparse_tag}"
+    if subspace_tag and args.use_hira_adapter:
+        classifier_variant = f"{classifier_variant}{subspace_tag}"
     if stability_ridge_tag and (args.use_hira_adapter or args.use_ranpac_head):
         classifier_variant = f"{classifier_variant}{stability_ridge_tag}"
     return classifier_variant
@@ -382,6 +396,8 @@ def evaluate_pipeline(args):
         "soft_threshold_beta": args.soft_threshold_beta,
         "soft_threshold_stat_eps": args.soft_threshold_stat_eps,
         "soft_threshold_mode": args.soft_threshold_mode,
+        "hira_subspace_rank": args.hira_subspace_rank,
+        "hira_subspace_shrink": args.hira_subspace_shrink,
         "ranpac_lambda": args.ranpac_lambda,
         "ranpac_temp": args.ranpac_temp,
         "ranpac_baseline_bias_centered": False,

@@ -109,6 +109,15 @@ def build_stability_ridge_name_tag(args, separator="-"):
     )
 
 
+def build_hira_subspace_name_tag(args, separator="-"):
+    if args.hira_subspace_rank <= 0:
+        return ""
+    tag = f"{separator}subr{args.hira_subspace_rank}"
+    if args.hira_subspace_shrink != 1.0:
+        tag = f"{tag}{separator}subs{_format_variant_value(args.hira_subspace_shrink)}"
+    return tag
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate RobustBench models with and without RanPAC.")
     parser.add_argument("--model-names", "--model_names", nargs="+", required=True, help="RobustBench model names to evaluate.")
@@ -205,6 +214,8 @@ def parse_args():
     parser.add_argument("--soft-threshold-beta", "--soft_threshold_beta", type=float, default=8.0, help="HiRA-only sharpness of the smooth mean-centered threshold.")
     parser.add_argument("--soft-threshold-stat-eps", "--soft_threshold_stat_eps", type=float, default=1e-6, help="HiRA-only minimum hidden-feature std used by the smooth mean-centered threshold.")
     parser.add_argument("--soft-threshold-mode", "--soft_threshold_mode", choices=["near_mean", "away_from_mean"], default="away_from_mean", help="HiRA-only inference sparsification target: pull ambiguous hidden features toward the mean or toward the nearest mean +/- alpha*std boundary.")
+    parser.add_argument("--hira-subspace-rank", "--hira_subspace_rank", type=int, default=0, help="HiRA-only clean projected-feature subspace rank; 0 disables clean-subspace calibration.")
+    parser.add_argument("--hira-subspace-shrink", "--hira_subspace_shrink", type=float, default=1.0, help="HiRA-only shrinkage applied to the residual orthogonal to the clean projected-feature subspace. 1 keeps the residual unchanged.")
     parser.add_argument("--stability-ridge-gamma", "--stability_ridge_gamma", type=float, default=0.0, help="Strength of the stability-aware diagonal ridge prior; 0 disables it.")
     parser.add_argument("--stability-ridge-stat-eps", "--stability_ridge_stat_eps", type=float, default=DEFAULT_STABILITY_RIDGE_STAT_EPS, help="Minimum projected-feature std used by the stability-aware ridge prior.")
     parser.add_argument(
@@ -860,6 +871,8 @@ def main():
                         soft_threshold_beta=args.soft_threshold_beta,
                         soft_threshold_stat_eps=args.soft_threshold_stat_eps,
                         soft_threshold_mode=args.soft_threshold_mode,
+                        subspace_rank=args.hira_subspace_rank,
+                        subspace_shrink=args.hira_subspace_shrink,
                         stability_ridge_gamma=args.stability_ridge_gamma,
                         stability_ridge_stat_eps=args.stability_ridge_stat_eps,
                     ).to(device).eval()
@@ -879,6 +892,8 @@ def main():
                         soft_threshold_beta=args.soft_threshold_beta,
                         soft_threshold_stat_eps=args.soft_threshold_stat_eps,
                         soft_threshold_mode=args.soft_threshold_mode,
+                        subspace_rank=args.hira_subspace_rank,
+                        subspace_shrink=args.hira_subspace_shrink,
                         stability_ridge_gamma=args.stability_ridge_gamma,
                         stability_ridge_stat_eps=args.stability_ridge_stat_eps,
                     )
@@ -926,6 +941,8 @@ def main():
                     )
                 if variant_cfg["use_hira"] and args.soft_threshold_alpha > 0:
                     benchmark_model_name = f"{benchmark_model_name}{build_meansparse_name_tag(args)}"
+                if variant_cfg["use_hira"] and args.hira_subspace_rank > 0:
+                    benchmark_model_name = f"{benchmark_model_name}{build_hira_subspace_name_tag(args)}"
                 if variant_cfg["use_hira"] or variant_cfg["use_ranpac"]:
                     benchmark_model_name = f"{benchmark_model_name}{build_stability_ridge_name_tag(args)}"
 
@@ -983,6 +1000,8 @@ def main():
                         "soft_threshold_beta": args.soft_threshold_beta,
                         "soft_threshold_stat_eps": args.soft_threshold_stat_eps,
                         "soft_threshold_mode": args.soft_threshold_mode,
+                        "hira_subspace_rank": args.hira_subspace_rank,
+                        "hira_subspace_shrink": args.hira_subspace_shrink,
                     }
                 )
                 results.append(metrics)

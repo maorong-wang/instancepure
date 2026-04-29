@@ -35,6 +35,25 @@ from dataset import get_dataset
 HIRA_CACHE_VERSION = 32
 
 
+def is_hira_subspace_enabled(subspace_rank, subspace_shrink):
+    return int(subspace_rank) > 0 and float(subspace_shrink) < 1.0
+
+
+def _resolve_hira_subspace_sample_cap(subspace_rank):
+    if int(subspace_rank) <= 0:
+        return 0
+    return max(512, 8 * int(subspace_rank))
+
+
+def build_hira_subspace_tag(subspace_rank, subspace_shrink, separator="-"):
+    if int(subspace_rank) <= 0:
+        return ""
+    parts = [f"subr{int(subspace_rank)}"]
+    if float(subspace_shrink) != 1.0:
+        parts.append(f"subs{format_cache_value(subspace_shrink)}")
+    return separator + separator.join(parts)
+
+
 class HiRAHalfPrecisionWrapper(nn.Module):
     def __init__(self, base_model):
         super().__init__()
@@ -59,16 +78,23 @@ class HiRAAdapter(nn.Module):
         soft_threshold_beta=8.0,
         soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
         soft_threshold_mode=DEFAULT_MEANSPARSE_MODE,
+        subspace_rank=0,
+        subspace_shrink=1.0,
     ):
         super().__init__()
         self.register_buffer("b_rand", torch.randn(in_features, expansion_dim, dtype=torch.float16))
         self.a_weight = nn.Parameter(torch.empty(out_features, expansion_dim, dtype=torch.float16))
         self.register_buffer("soft_threshold_mean", torch.zeros(expansion_dim, dtype=torch.float32))
         self.register_buffer("soft_threshold_std", torch.ones(expansion_dim, dtype=torch.float32))
+        self.register_buffer("clean_subspace_mean", torch.zeros(expansion_dim, dtype=torch.float32))
+        self.register_buffer("clean_subspace_basis", torch.zeros(expansion_dim, int(subspace_rank), dtype=torch.float32))
+        self.register_buffer("clean_subspace_valid_rank", torch.zeros((), dtype=torch.int64))
         self.soft_threshold_alpha = float(soft_threshold_alpha)
         self.soft_threshold_beta = float(soft_threshold_beta)
         self.soft_threshold_stat_eps = float(soft_threshold_stat_eps)
         self.soft_threshold_mode = validate_meansparse_mode(soft_threshold_mode)
+        self.subspace_rank = int(subspace_rank)
+        self.subspace_shrink = float(subspace_shrink)
         self.force_fp32 = False
         self._fp32_cache_device = None
         self._b_rand_fp32 = None
@@ -88,6 +114,26 @@ class HiRAAdapter(nn.Module):
         self._a_weight_fp32 = self.a_weight.detach().float().to(device=device)
         self._fp32_cache_device = cache_device
 
+    def apply_clean_subspace_calibration(self, projected):
+        if (
+            self.subspace_rank <= 0
+            or self.subspace_shrink >= 1.0
+            or int(self.clean_subspace_valid_rank.item()) <= 0
+        ):
+            return projected
+
+        projected_float = projected.float()
+        mean = self.clean_subspace_mean.to(device=projected.device, dtype=torch.float32).view(1, -1)
+        basis = self.clean_subspace_basis[:, : int(self.clean_subspace_valid_rank.item())].to(
+            device=projected.device,
+            dtype=torch.float32,
+        )
+        delta = projected_float - mean
+        parallel = (delta @ basis) @ basis.t()
+        orthogonal = delta - parallel
+        calibrated = mean + parallel + self.subspace_shrink * orthogonal
+        return calibrated.to(dtype=projected.dtype)
+
     def project_hidden(self, x, apply_soft_threshold):
         token_features = x.reshape(-1, x.shape[-1])
         if self.force_fp32:
@@ -104,7 +150,7 @@ class HiRAAdapter(nn.Module):
             token_features = token_features.float()
             projected = token_features @ self.b_rand.float()
         projected = F.gelu(projected)
-        if apply_soft_threshold:
+        if apply_soft_threshold and not self.training:
             projected = apply_mean_centered_soft_threshold(
                 projected,
                 self.soft_threshold_mean,
@@ -114,6 +160,8 @@ class HiRAAdapter(nn.Module):
                 stat_eps=self.soft_threshold_stat_eps,
                 mode=self.soft_threshold_mode,
             )
+        if not self.training:
+            projected = self.apply_clean_subspace_calibration(projected)
         return projected
 
     def forward(self, x):
@@ -139,6 +187,8 @@ class HiRAMlpWrapper(nn.Module):
         soft_threshold_beta=8.0,
         soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
         soft_threshold_mode=DEFAULT_MEANSPARSE_MODE,
+        subspace_rank=0,
+        subspace_shrink=1.0,
     ):
         super().__init__()
         self.base_mlp = base_mlp
@@ -151,6 +201,8 @@ class HiRAMlpWrapper(nn.Module):
             soft_threshold_beta=soft_threshold_beta,
             soft_threshold_stat_eps=soft_threshold_stat_eps,
             soft_threshold_mode=soft_threshold_mode,
+            subspace_rank=subspace_rank,
+            subspace_shrink=subspace_shrink,
         )
 
     def forward(self, x, *args, **kwargs):
@@ -210,6 +262,8 @@ def _attach_hira_modules(
     soft_threshold_beta=8.0,
     soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
     soft_threshold_mode=DEFAULT_MEANSPARSE_MODE,
+    subspace_rank=0,
+    subspace_shrink=1.0,
 ):
     target_mlp_names = []
     for module_name, module in _resolve_target_mlp_modules(model, num_adapter_blocks):
@@ -218,6 +272,16 @@ def _attach_hira_modules(
             module.mlp_adapter.soft_threshold_beta = float(soft_threshold_beta)
             module.mlp_adapter.soft_threshold_stat_eps = float(soft_threshold_stat_eps)
             module.mlp_adapter.soft_threshold_mode = validate_meansparse_mode(soft_threshold_mode)
+            module.mlp_adapter.subspace_rank = int(subspace_rank)
+            module.mlp_adapter.subspace_shrink = float(subspace_shrink)
+            if module.mlp_adapter.clean_subspace_basis.shape[1] != int(subspace_rank):
+                expansion_dim_current = module.mlp_adapter.clean_subspace_mean.numel()
+                module.mlp_adapter.clean_subspace_basis = torch.zeros(
+                    expansion_dim_current,
+                    int(subspace_rank),
+                    dtype=torch.float32,
+                )
+                module.mlp_adapter.clean_subspace_valid_rank.zero_()
             target_mlp_names.append(module_name)
             continue
         _set_module_by_name(
@@ -230,6 +294,8 @@ def _attach_hira_modules(
                 soft_threshold_beta=soft_threshold_beta,
                 soft_threshold_stat_eps=soft_threshold_stat_eps,
                 soft_threshold_mode=soft_threshold_mode,
+                subspace_rank=subspace_rank,
+                subspace_shrink=subspace_shrink,
             ),
         )
         target_mlp_names.append(module_name)
@@ -306,6 +372,8 @@ def build_hira_variant_name(
     soft_threshold_beta=8.0,
     soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
     soft_threshold_mode=DEFAULT_MEANSPARSE_MODE,
+    subspace_rank=0,
+    subspace_shrink=1.0,
     stability_ridge_gamma=0.0,
     stability_ridge_stat_eps=DEFAULT_STABILITY_RIDGE_STAT_EPS,
 ):
@@ -325,6 +393,11 @@ def build_hira_variant_name(
         separator="-",
         mode=soft_threshold_mode,
     )
+    subspace_tag = build_hira_subspace_tag(
+        subspace_rank=subspace_rank,
+        subspace_shrink=subspace_shrink,
+        separator="-",
+    )
     stability_tag = build_stability_ridge_tag(
         gamma=stability_ridge_gamma,
         stat_eps=stability_ridge_stat_eps,
@@ -338,6 +411,7 @@ def build_hira_variant_name(
         f"-seed{seed}"
         f"{noise_tag}"
         f"{meansparse_tag}"
+        f"{subspace_tag}"
         f"{stability_tag}"
     )
 
@@ -358,10 +432,12 @@ def _build_cache_name(
     soft_threshold_beta,
     soft_threshold_stat_eps,
     soft_threshold_mode,
+    subspace_rank,
+    subspace_shrink,
     stability_ridge_gamma,
     stability_ridge_stat_eps,
 ):
-    del soft_threshold_alpha, soft_threshold_beta, soft_threshold_stat_eps, soft_threshold_mode
+    del soft_threshold_alpha, soft_threshold_beta, soft_threshold_stat_eps, soft_threshold_mode, subspace_shrink
     return build_hira_variant_name(
         classifier_name=strip_meansparse_tag(classifier_name),
         expansion_dim=expansion_dim,
@@ -378,6 +454,8 @@ def _build_cache_name(
         soft_threshold_beta=8.0,
         soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
         soft_threshold_mode=DEFAULT_MEANSPARSE_MODE,
+        subspace_rank=subspace_rank,
+        subspace_shrink=1.0,
         stability_ridge_gamma=stability_ridge_gamma,
         stability_ridge_stat_eps=stability_ridge_stat_eps,
     ).replace("/", "_") + ".pt"
@@ -434,6 +512,8 @@ def _init_hira_statistics(
     stats_device,
     collect_feature_stats=False,
     collect_projected_stability_stats=False,
+    collect_clean_subspace_stats=False,
+    clean_subspace_rank=0,
 ):
     statistics = {}
     for module_name in mlp_module_names:
@@ -450,6 +530,17 @@ def _init_hira_statistics(
             entry["feature_sum"] = torch.zeros(rp_dim, dtype=torch.float64, device=stats_device)
             entry["feature_sum_sq"] = torch.zeros(rp_dim, dtype=torch.float64, device=stats_device)
             entry["feature_sample_count"] = 0
+        if collect_clean_subspace_stats:
+            subspace_sample_cap = _resolve_hira_subspace_sample_cap(clean_subspace_rank)
+            entry["clean_subspace_sample_cap"] = subspace_sample_cap
+            entry["clean_subspace_rank"] = int(clean_subspace_rank)
+            entry["clean_subspace_samples"] = torch.empty(
+                subspace_sample_cap,
+                rp_dim,
+                dtype=torch.float16,
+                device="cpu",
+            )
+            entry["clean_subspace_sample_count"] = 0
         if collect_projected_stability_stats:
             entry["projected_sum"] = torch.zeros(rp_dim, dtype=torch.float64, device=stats_device)
             entry["projected_sum_sq"] = torch.zeros(rp_dim, dtype=torch.float64, device=stats_device)
@@ -467,6 +558,56 @@ def _accumulate_feature_statistics(entry, source_tokens):
     entry["feature_sum"] += source_tokens.sum(dim=0)
     entry["feature_sum_sq"] += source_tokens.square().sum(dim=0)
     entry["feature_sample_count"] += source_tokens.size(0)
+
+
+def _accumulate_clean_subspace_samples(entry, source_tokens):
+    sample_cap = entry.get("clean_subspace_sample_cap", 0)
+    sample_count = entry.get("clean_subspace_sample_count", 0)
+    if sample_cap <= 0 or sample_count >= sample_cap:
+        return
+
+    take_count = min(sample_cap - sample_count, source_tokens.size(0))
+    entry["clean_subspace_samples"][sample_count:sample_count + take_count].copy_(
+        source_tokens[:take_count].to(device="cpu", dtype=torch.float16)
+    )
+    entry["clean_subspace_sample_count"] += take_count
+
+
+def _build_clean_subspace_basis(entry):
+    requested_rank = int(entry.get("clean_subspace_rank", 0))
+    subspace_rank = min(
+        requested_rank,
+        int(entry.get("clean_subspace_sample_count", 0)),
+    )
+    feature_mean = entry["feature_sum"] / float(entry["feature_sample_count"])
+    rp_dim = feature_mean.numel()
+    if requested_rank <= 0:
+        return feature_mean.float().cpu(), torch.empty(rp_dim, 0, dtype=torch.float32), 0
+    if subspace_rank <= 0:
+        return feature_mean.float().cpu(), torch.zeros(rp_dim, requested_rank, dtype=torch.float32), 0
+
+    sampled = entry["clean_subspace_samples"][: entry["clean_subspace_sample_count"]].float()
+    centered = sampled - feature_mean.float().cpu().view(1, -1)
+    if centered.size(0) <= 1:
+        return feature_mean.float().cpu(), torch.zeros(rp_dim, requested_rank, dtype=torch.float32), 0
+
+    gram = centered @ centered.t()
+    eigenvalues, eigenvectors = torch.linalg.eigh(gram)
+    positive = eigenvalues > 1e-8
+    if int(positive.sum().item()) == 0:
+        return feature_mean.float().cpu(), torch.zeros(rp_dim, requested_rank, dtype=torch.float32), 0
+
+    valid_rank = min(subspace_rank, int(positive.sum().item()))
+    top_values = eigenvalues[positive][-valid_rank:]
+    top_vectors = eigenvectors[:, positive][:, -valid_rank:]
+    basis = centered.t() @ top_vectors
+    basis = basis / top_values.clamp_min(1e-8).sqrt().unsqueeze(0)
+    basis = torch.linalg.qr(basis, mode="reduced").Q.float().cpu()
+    if valid_rank < requested_rank:
+        padded_basis = torch.zeros(rp_dim, requested_rank, dtype=torch.float32)
+        padded_basis[:, :valid_rank] = basis
+        basis = padded_basis
+    return feature_mean.float().cpu(), basis, valid_rank
 
 
 def _project_hira_tokens(source_tokens, b_rand):
@@ -543,6 +684,8 @@ def _accumulate_hira_statistics(
     adapt_alpha,
     collect_feature_stats=False,
     collect_projected_stability_stats=False,
+    collect_clean_subspace_stats=False,
+    clean_subspace_rank=0,
 ):
     stats_device = device if device.type == "cuda" else torch.device("cpu")
     statistics = _init_hira_statistics(
@@ -551,6 +694,8 @@ def _accumulate_hira_statistics(
         stats_device,
         collect_feature_stats=collect_feature_stats,
         collect_projected_stability_stats=collect_projected_stability_stats,
+        collect_clean_subspace_stats=collect_clean_subspace_stats,
+        clean_subspace_rank=clean_subspace_rank,
     )
     b_rand_by_module = {
         module_name: _get_module_by_name(model, module_name).mlp_adapter.b_rand.to(
@@ -596,6 +741,8 @@ def _accumulate_hira_statistics(
                         clean_projected = _project_hira_tokens(clean_inputs, b_rand_by_module[module_name])
                         if collect_feature_stats:
                             _accumulate_feature_statistics(statistics[module_name], clean_projected)
+                        if collect_clean_subspace_stats:
+                            _accumulate_clean_subspace_samples(statistics[module_name], clean_projected)
                         if not use_noisy_adaptation:
                             _accumulate_projected_statistics(
                                 statistics[module_name],
@@ -643,6 +790,11 @@ def _accumulate_hira_statistics(
             feature_var = entry["feature_sum_sq"] / float(entry["feature_sample_count"]) - feature_mean.square()
             entry["soft_threshold_mean"] = feature_mean.float().cpu()
             entry["soft_threshold_std"] = feature_var.clamp_min(0.0).sqrt().float().cpu()
+            if collect_clean_subspace_stats:
+                clean_subspace_mean, clean_subspace_basis, clean_subspace_valid_rank = _build_clean_subspace_basis(entry)
+                entry["clean_subspace_mean"] = clean_subspace_mean
+                entry["clean_subspace_basis"] = clean_subspace_basis
+                entry["clean_subspace_valid_rank"] = clean_subspace_valid_rank
 
     return statistics
 
@@ -657,6 +809,7 @@ def _fit_hira_weights_closed_form(
     adapt_noise_eps,
     adapt_noise_num,
     adapt_alpha,
+    subspace_rank,
     stability_ridge_gamma,
     stability_ridge_stat_eps,
 ):
@@ -673,6 +826,8 @@ def _fit_hira_weights_closed_form(
         adapt_noise_num=adapt_noise_num,
         adapt_alpha=adapt_alpha,
         collect_feature_stats=True,
+        collect_clean_subspace_stats=int(subspace_rank) > 0,
+        clean_subspace_rank=subspace_rank,
         collect_projected_stability_stats=is_stability_ridge_enabled(stability_ridge_gamma),
     )
     val_stats = _accumulate_hira_statistics(
@@ -705,6 +860,12 @@ def _fit_hira_weights_closed_form(
         with torch.no_grad():
             wrapper.mlp_adapter.soft_threshold_mean.copy_(train_entry["soft_threshold_mean"])
             wrapper.mlp_adapter.soft_threshold_std.copy_(train_entry["soft_threshold_std"])
+            if int(subspace_rank) > 0:
+                wrapper.mlp_adapter.clean_subspace_mean.copy_(train_entry["clean_subspace_mean"])
+                wrapper.mlp_adapter.clean_subspace_basis = train_entry["clean_subspace_basis"].to(
+                    dtype=torch.float32,
+                )
+                wrapper.mlp_adapter.clean_subspace_valid_rank.fill_(int(train_entry["clean_subspace_valid_rank"]))
 
         ridge, regression_loss = _select_ridge_by_regression_loss(
             train_entry["g_matrix"],
@@ -763,6 +924,8 @@ def apply_hira_adaptation(
     soft_threshold_beta=8.0,
     soft_threshold_stat_eps=DEFAULT_MEANSPARSE_STAT_EPS,
     soft_threshold_mode=DEFAULT_MEANSPARSE_MODE,
+    subspace_rank=0,
+    subspace_shrink=1.0,
     stability_ridge_gamma=0.0,
     stability_ridge_stat_eps=DEFAULT_STABILITY_RIDGE_STAT_EPS,
 ):
@@ -779,6 +942,10 @@ def apply_hira_adaptation(
     if soft_threshold_stat_eps <= 0:
         raise ValueError("HiRA soft_threshold_stat_eps must be positive.")
     validate_meansparse_mode(soft_threshold_mode)
+    if subspace_rank < 0:
+        raise ValueError("HiRA subspace_rank must be non-negative.")
+    if not 0.0 <= subspace_shrink <= 1.0:
+        raise ValueError("HiRA subspace_shrink must lie in [0, 1].")
     if stability_ridge_gamma < 0:
         raise ValueError("HiRA stability_ridge_gamma must be non-negative.")
     if stability_ridge_stat_eps <= 0:
@@ -799,6 +966,8 @@ def apply_hira_adaptation(
         soft_threshold_beta=soft_threshold_beta,
         soft_threshold_stat_eps=soft_threshold_stat_eps,
         soft_threshold_mode=soft_threshold_mode,
+        subspace_rank=subspace_rank,
+        subspace_shrink=subspace_shrink,
     )
     _freeze_model(model)
 
@@ -821,6 +990,8 @@ def apply_hira_adaptation(
             soft_threshold_beta=soft_threshold_beta,
             soft_threshold_stat_eps=soft_threshold_stat_eps,
             soft_threshold_mode=soft_threshold_mode,
+            subspace_rank=subspace_rank,
+            subspace_shrink=subspace_shrink,
             stability_ridge_gamma=stability_ridge_gamma,
             stability_ridge_stat_eps=stability_ridge_stat_eps,
         ),
@@ -851,6 +1022,7 @@ def apply_hira_adaptation(
         adapt_noise_eps=adapt_noise_eps,
         adapt_noise_num=adapt_noise_num,
         adapt_alpha=adapt_alpha,
+        subspace_rank=subspace_rank,
         stability_ridge_gamma=stability_ridge_gamma,
         stability_ridge_stat_eps=stability_ridge_stat_eps,
     )
@@ -870,6 +1042,10 @@ def apply_hira_adaptation(
         "soft_threshold_beta": soft_threshold_beta,
         "soft_threshold_stat_eps": soft_threshold_stat_eps,
         "soft_threshold_mode": soft_threshold_mode,
+        "subspace_enabled": is_hira_subspace_enabled(subspace_rank, subspace_shrink),
+        "subspace_rank": subspace_rank,
+        "subspace_shrink": subspace_shrink,
+        "subspace_sample_cap": _resolve_hira_subspace_sample_cap(subspace_rank),
         "stability_ridge_enabled": is_stability_ridge_enabled(stability_ridge_gamma),
         "stability_ridge_gamma": stability_ridge_gamma,
         "stability_ridge_stat_eps": stability_ridge_stat_eps,
@@ -885,6 +1061,11 @@ def apply_hira_adaptation(
         "soft_threshold_stage": "after_gelu_before_b",
         "soft_threshold_train_usage": "disabled",
         "soft_threshold_eval_usage": "enabled" if is_meansparse_enabled(soft_threshold_alpha) else "disabled",
+        "subspace_mean_source": "train_clean_gelu_a_feature_channel",
+        "subspace_basis_source": "train_clean_gelu_a_feature_top_pcs",
+        "subspace_stage": "after_soft_threshold_before_b",
+        "subspace_train_usage": "disabled",
+        "subspace_eval_usage": "enabled" if is_hira_subspace_enabled(subspace_rank, subspace_shrink) else "disabled",
         "frozen_b": True,
         "ridge_fit_summary": fit_summary,
         "cache_adapter_dtype": "float16",

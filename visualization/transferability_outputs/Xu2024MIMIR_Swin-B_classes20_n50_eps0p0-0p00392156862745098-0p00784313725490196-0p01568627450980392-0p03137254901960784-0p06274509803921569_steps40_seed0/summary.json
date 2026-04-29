@@ -1,0 +1,59 @@
+{
+  "model_name": "Xu2024MIMIR_Swin-B",
+  "dataset": "imagenet",
+  "threat_model": "Linf",
+  "selected_class_ids": [
+    41,
+    265,
+    310,
+    366,
+    394,
+    414,
+    430,
+    488,
+    497,
+    523,
+    597,
+    776,
+    802,
+    849,
+    864,
+    911,
+    913,
+    940,
+    988,
+    991
+  ],
+  "samples_per_class": 50,
+  "eps_values": [
+    0.0,
+    0.00392156862745098,
+    0.00784313725490196,
+    0.01568627450980392,
+    0.03137254901960784,
+    0.06274509803921569
+  ],
+  "eps_pixels": [
+    0.0,
+    1.0,
+    2.0,
+    4.0,
+    8.0,
+    16.0
+  ],
+  "pgd_steps": 40,
+  "pgd_step_size": null,
+  "pgd_random_start": true,
+  "mask_pgd_logits": false,
+  "outputs": [
+    "transfer_accuracy_vs_eps.png",
+    "worst_source_accuracy_vs_eps.png",
+    "transfer_success_rate_vs_eps.png",
+    "transfer_toplogit_norm_margin_vs_eps.png",
+    "transfer_accuracy_heatmaps.png",
+    "aggregate_transfer_metrics.csv",
+    "transfer_summary.csv",
+    "clean_metrics.csv",
+    "per_sample_transfer_metrics.csv"
+  ]
+}

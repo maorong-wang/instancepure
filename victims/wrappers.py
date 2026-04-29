@@ -31,6 +31,8 @@ class VictimWrapperConfig:
     soft_threshold_beta: float = 8.0
     soft_threshold_stat_eps: float = DEFAULT_MEANSPARSE_STAT_EPS
     soft_threshold_mode: str = "away_from_mean"
+    hira_subspace_rank: int = 0
+    hira_subspace_shrink: float = 1.0
     stability_ridge_gamma: float = 0.0
     stability_ridge_stat_eps: float = DEFAULT_STABILITY_RIDGE_STAT_EPS
     use_ranpac: bool = False
@@ -89,6 +91,8 @@ def build_wrapper_config_from_namespace(args, dataset="imagenet"):
         soft_threshold_beta=getattr(args, "soft_threshold_beta", 8.0),
         soft_threshold_stat_eps=getattr(args, "soft_threshold_stat_eps", DEFAULT_MEANSPARSE_STAT_EPS),
         soft_threshold_mode=getattr(args, "soft_threshold_mode", "away_from_mean"),
+        hira_subspace_rank=getattr(args, "hira_subspace_rank", 0),
+        hira_subspace_shrink=getattr(args, "hira_subspace_shrink", 1.0),
         stability_ridge_gamma=getattr(args, "stability_ridge_gamma", 0.0),
         stability_ridge_stat_eps=getattr(args, "stability_ridge_stat_eps", DEFAULT_STABILITY_RIDGE_STAT_EPS),
         use_ranpac=use_ranpac,
@@ -135,6 +139,8 @@ def apply_victim_wrappers(classifier, classifier_name, supports_hira_arch, confi
             soft_threshold_beta=config.soft_threshold_beta,
             soft_threshold_stat_eps=config.soft_threshold_stat_eps,
             soft_threshold_mode=config.soft_threshold_mode,
+            subspace_rank=config.hira_subspace_rank,
+            subspace_shrink=config.hira_subspace_shrink,
             stability_ridge_gamma=config.stability_ridge_gamma,
             stability_ridge_stat_eps=config.stability_ridge_stat_eps,
         )
@@ -154,6 +160,8 @@ def apply_victim_wrappers(classifier, classifier_name, supports_hira_arch, confi
             soft_threshold_beta=config.soft_threshold_beta,
             soft_threshold_stat_eps=config.soft_threshold_stat_eps,
             soft_threshold_mode=config.soft_threshold_mode,
+            subspace_rank=config.hira_subspace_rank,
+            subspace_shrink=config.hira_subspace_shrink,
             stability_ridge_gamma=config.stability_ridge_gamma,
             stability_ridge_stat_eps=config.stability_ridge_stat_eps,
         )

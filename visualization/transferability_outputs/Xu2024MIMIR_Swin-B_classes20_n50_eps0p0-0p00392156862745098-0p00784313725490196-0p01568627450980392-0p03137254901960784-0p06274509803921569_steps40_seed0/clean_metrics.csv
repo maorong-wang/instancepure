@@ -1,0 +1,3 @@
+eval_model,total,clean_accuracy,clean_toplogit_norm_margin_mean,clean_toplogit_norm_margin_median,clean_toplogit_norm_margin_p25,clean_toplogit_norm_margin_p75
+original,1000,0.735,0.2086730496166274,0.2947865277528763,-0.030609574168920517,0.49910473078489304
+hira_ranpac_regression,1000,0.732,0.21846085707804014,0.30804702639579773,-0.05131717398762703,0.5209562033414841
