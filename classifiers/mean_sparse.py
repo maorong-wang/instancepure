@@ -89,5 +89,6 @@ def apply_mean_centered_soft_threshold(
     else:
         boundary = float(alpha) * std
         boundary_aligned_abs = boundary + gate * (diff_abs - boundary)
-        output = mean + diff.sign() * boundary_aligned_abs
+        smooth_direction = 2.0 * torch.sigmoid(float(beta) * diff / std) - 1.0
+        output = mean + smooth_direction * boundary_aligned_abs
     return output.to(dtype=x.dtype)
