@@ -1,4 +1,5 @@
 import os
+import re
 
 from tqdm.auto import tqdm
 
@@ -20,6 +21,91 @@ from classifiers.stability_ridge import (
 
 RIDGE_CANDIDATES = [10.0 ** power for power in range(-8, 14)]
 RANPAC_CACHE_VERSION = 17
+
+
+def strip_hira_subspace_tag(text):
+    text = re.sub(r"_subr[^_]+(?:_subs[^_]+)?", "", text)
+    text = re.sub(r"-subr[^-]+(?:-subs[^-]+)?", "", text)
+    text = re.sub(r"_subs[^_]+", "", text)
+    text = re.sub(r"-subs[^-]+", "", text)
+    return text
+
+
+def _normalize_ranpac_cache_classifier_name(classifier_name):
+    return strip_hira_subspace_tag(strip_meansparse_tag(classifier_name))
+
+
+def _build_ranpac_cache_name(
+    classifier_name,
+    rp_dim,
+    seed,
+    adapt_noise_eps,
+    adapt_noise_num,
+    adapt_alpha,
+    hardneg_topk,
+    hardneg_gamma,
+    stability_ridge_gamma,
+    stability_ridge_stat_eps,
+):
+    noise_tag = (
+        f"_neps{format_cache_value(adapt_noise_eps)}"
+        f"_nnum{adapt_noise_num}"
+        f"_na{format_cache_value(adapt_alpha)}"
+    )
+    hardneg_tag = (
+        f"_htk{hardneg_topk}"
+        f"_hg{format_cache_value(hardneg_gamma)}"
+    )
+    stability_tag = build_stability_ridge_tag(
+        gamma=stability_ridge_gamma,
+        stat_eps=stability_ridge_stat_eps,
+        separator="_",
+    )
+    cache_base = (
+        f"{classifier_name.replace('/', '_')}_rp{rp_dim}_seed{seed}"
+        f"{noise_tag}{hardneg_tag}{stability_tag}"
+    )
+    return f"{cache_base}_ranpac_v{RANPAC_CACHE_VERSION}.pt"
+
+
+def _iter_ranpac_cache_candidate_paths(
+    cache_dir,
+    classifier_name,
+    rp_dim,
+    seed,
+    adapt_noise_eps,
+    adapt_noise_num,
+    adapt_alpha,
+    hardneg_topk,
+    hardneg_gamma,
+    stability_ridge_gamma,
+    stability_ridge_stat_eps,
+):
+    canonical_classifier_name = _normalize_ranpac_cache_classifier_name(classifier_name)
+    legacy_classifier_names = [
+        strip_meansparse_tag(classifier_name),
+        classifier_name,
+    ]
+    seen = set()
+    for candidate_classifier_name in [canonical_classifier_name] + legacy_classifier_names:
+        if candidate_classifier_name in seen:
+            continue
+        seen.add(candidate_classifier_name)
+        yield os.path.join(
+            cache_dir,
+            _build_ranpac_cache_name(
+                candidate_classifier_name,
+                rp_dim=rp_dim,
+                seed=seed,
+                adapt_noise_eps=adapt_noise_eps,
+                adapt_noise_num=adapt_noise_num,
+                adapt_alpha=adapt_alpha,
+                hardneg_topk=hardneg_topk,
+                hardneg_gamma=hardneg_gamma,
+                stability_ridge_gamma=stability_ridge_gamma,
+                stability_ridge_stat_eps=stability_ridge_stat_eps,
+            ),
+        )
 
 
 def _project_ranpac_backbone_features(features, w_rand):
@@ -611,35 +697,31 @@ def apply_ranpac_head(
     else:
         device = torch.device(device)
 
-    noise_tag = (
-        f"_neps{format_cache_value(adapt_noise_eps)}"
-        f"_nnum{adapt_noise_num}"
-        f"_na{format_cache_value(adapt_alpha)}"
+    candidate_cache_paths = list(
+        _iter_ranpac_cache_candidate_paths(
+            cache_dir=cache_dir,
+            classifier_name=classifier_name,
+            rp_dim=rp_dim,
+            seed=seed,
+            adapt_noise_eps=adapt_noise_eps,
+            adapt_noise_num=adapt_noise_num,
+            adapt_alpha=adapt_alpha,
+            hardneg_topk=hardneg_topk,
+            hardneg_gamma=hardneg_gamma,
+            stability_ridge_gamma=stability_ridge_gamma,
+            stability_ridge_stat_eps=stability_ridge_stat_eps,
+        )
     )
-    hardneg_tag = (
-        f"_htk{hardneg_topk}"
-        f"_hg{format_cache_value(hardneg_gamma)}"
-    )
-    stability_tag = build_stability_ridge_tag(
-        gamma=stability_ridge_gamma,
-        stat_eps=stability_ridge_stat_eps,
-        separator="_",
-    )
-    cache_classifier_name = strip_meansparse_tag(classifier_name)
-    cache_base = (
-        f"{cache_classifier_name.replace('/', '_')}_rp{rp_dim}_seed{seed}"
-        f"{noise_tag}{hardneg_tag}{stability_tag}"
-    )
-    cache_name = (
-        f"{cache_base}_ranpac_v{RANPAC_CACHE_VERSION}.pt"
-    )
-    cache_path = os.path.join(cache_dir, cache_name)
+    cache_path = candidate_cache_paths[0]
 
     layer_name, linear_layer = _find_last_linear(model)
-    if os.path.exists(cache_path):
-        state = torch.load(cache_path, map_location="cpu")
-    else:
-        state = None
+    state = None
+    for candidate_cache_path in candidate_cache_paths:
+        if not os.path.exists(candidate_cache_path):
+            continue
+        state = torch.load(candidate_cache_path, map_location="cpu")
+        cache_path = candidate_cache_path
+        break
 
     if state is None or state.get("version") != RANPAC_CACHE_VERSION or "weight" not in state:
         state = _fit_ranpac_state(

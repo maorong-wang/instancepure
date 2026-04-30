@@ -27,8 +27,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchvision
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 
 from classifiers.hira import apply_hira_adaptation, build_hira_variant_name
@@ -37,7 +36,6 @@ from classifiers.stability_ridge import (
     DEFAULT_STABILITY_RIDGE_STAT_EPS,
     build_stability_ridge_tag,
 )
-from dataset import get_dataset as instantpure_get_dataset
 
 try:
     from autoattack import AutoAttack
@@ -46,14 +44,14 @@ except ImportError:
 
 try:
     from robustbench import benchmark, load_model
-    from robustbench.data import get_preprocessing
+    from robustbench.data import get_preprocessing, load_clean_dataset
     from robustbench.model_zoo.enums import BenchmarkDataset, ThreatModel
 except ImportError:
     fallback_root = Path(__file__).resolve().parent.parent / "adversarial-attacks-pytorch"
     if str(fallback_root) not in sys.path:
         sys.path.insert(0, str(fallback_root))
     from robustbench import benchmark, load_model
-    from robustbench.data import get_preprocessing
+    from robustbench.data import get_preprocessing, load_clean_dataset
     from robustbench.model_zoo.enums import BenchmarkDataset, ThreatModel
 
 
@@ -371,43 +369,6 @@ def resolve_attack_threat_model(args):
     return args.attack_threat_model or args.threat_model
 
 
-def build_dataset(dataset, split, data_dir, transform):
-    if dataset == BenchmarkDataset.cifar_10.value:
-        return torchvision.datasets.CIFAR10(
-            root=data_dir,
-            train=(split == "train"),
-            transform=transform,
-            download=True,
-        )
-    if dataset == BenchmarkDataset.cifar_100.value:
-        return torchvision.datasets.CIFAR100(
-            root=data_dir,
-            train=(split == "train"),
-            transform=transform,
-            download=True,
-        )
-    if dataset == BenchmarkDataset.imagenet.value:
-        image_net_root = str(Path(data_dir))
-        import os
-
-        os.environ["IMAGENET_LOC_ENV"] = image_net_root
-        instantpure_split = "train" if split == "train" else "test"
-        dataset_obj = instantpure_get_dataset("imagenet", split=instantpure_split, adv=False)
-        if hasattr(dataset_obj, "transform") and transform is not None:
-            dataset_obj.transform = transform
-        return dataset_obj
-    raise NotImplementedError(f"Unsupported dataset: {dataset}")
-
-
-def random_subset(dataset, n_examples, seed):
-    if n_examples is None or n_examples < 0 or n_examples >= len(dataset):
-        return dataset
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-    indices = torch.randperm(len(dataset), generator=generator)[:n_examples].tolist()
-    return Subset(dataset, indices)
-
-
 def resolve_model_preprocessing(dataset, threat_model, model_name):
     return get_preprocessing(BenchmarkDataset(dataset), ThreatModel(threat_model), model_name, None)
 
@@ -415,8 +376,8 @@ def resolve_model_preprocessing(dataset, threat_model, model_name):
 def build_eval_loader(dataset, threat_model, model_name, data_dir, n_examples, seed, batch_size, num_workers, eval_split, transform=None):
     if transform is None:
         transform = resolve_model_preprocessing(dataset, threat_model, model_name)
-    eval_dataset = build_dataset(dataset, eval_split, data_dir, transform)
-    eval_dataset = random_subset(eval_dataset, n_examples, seed)
+    inputs, targets = load_clean_dataset(BenchmarkDataset(dataset), n_examples, data_dir, transform)
+    eval_dataset = TensorDataset(inputs, targets)
     return DataLoader(
         eval_dataset,
         batch_size=batch_size,
