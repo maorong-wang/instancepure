@@ -1,6 +1,6 @@
 program: eval_robustbench_ranpac.py
 method: grid
-project: robustbench-ranpac-hira-rc-sweep_for_submission_pgd2
+project: robustbench-ranpac-hira-rc-sweep_for_submission_new_sparse
 name: robustbench-ranpac-hira-imagenet
 metric:
   name: robust_acc
@@ -25,11 +25,11 @@ parameters:
       - RodriguezMunoz2024Characterizing_Swin-L
       - RodriguezMunoz2024Characterizing_Swin-B
   use_hira:
-    values: [false]
+    values: [true]
   use_ranpac:
-    values: [false]
+    values: [true]
   attack_method:
-    values: [pgd]
+    values: [autoattack]
   eval_examples:
     value: 5000
   eval_split:
@@ -77,15 +77,15 @@ parameters:
   adapt_alpha:
     value: 1
   soft_threshold_alpha:
-    values: [0.0]
+    values: [1.5]
   soft_threshold_beta:
-    values: [4.0]
+    values: [16.0]
   soft_threshold_stat_eps:
     value: 1.0e-6
   soft_threshold_mode:
     values: ["away_from_mean"]
   hira_subspace_rank:
-    values: [128]
+    values: [1024]
   hira_subspace_shrink:
     values: [0.5]
   stability_ridge_gamma:

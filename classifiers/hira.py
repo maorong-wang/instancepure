@@ -32,7 +32,7 @@ from classifiers.stability_ridge import (
 from dataset import get_dataset
 
 
-HIRA_CACHE_VERSION = 32
+HIRA_CACHE_VERSION = 35
 
 
 def is_hira_subspace_enabled(subspace_rank, subspace_shrink):
@@ -88,6 +88,8 @@ class HiRAAdapter(nn.Module):
         self.register_buffer("soft_threshold_std", torch.ones(expansion_dim, dtype=torch.float32))
         self.register_buffer("clean_subspace_mean", torch.zeros(expansion_dim, dtype=torch.float32))
         self.register_buffer("clean_subspace_basis", torch.zeros(expansion_dim, int(subspace_rank), dtype=torch.float32))
+        self.register_buffer("clean_subspace_coeff_mean", torch.zeros(int(subspace_rank), dtype=torch.float32))
+        self.register_buffer("clean_subspace_coeff_std", torch.ones(int(subspace_rank), dtype=torch.float32))
         self.register_buffer("clean_subspace_valid_rank", torch.zeros((), dtype=torch.int64))
         self.soft_threshold_alpha = float(soft_threshold_alpha)
         self.soft_threshold_beta = float(soft_threshold_beta)
@@ -129,9 +131,19 @@ class HiRAAdapter(nn.Module):
             dtype=torch.float32,
         )
         delta = projected_float - mean
-        parallel = (delta @ basis) @ basis.t()
+        coeff = delta @ basis
+        coeff_std = self.clean_subspace_coeff_std[: int(self.clean_subspace_valid_rank.item())].to(
+            device=projected.device,
+            dtype=torch.float32,
+        ).clamp_min(float(self.soft_threshold_stat_eps)).view(1, -1)
+        coeff_scale = float(self.soft_threshold_alpha) * coeff_std
+        coeff_scale = coeff_scale.clamp_min(float(self.soft_threshold_stat_eps))
+        coeff_tilde = coeff_scale * torch.tanh(coeff / coeff_scale)
+
+        parallel = coeff @ basis.t()
+        parallel_tilde = coeff_tilde @ basis.t()
         orthogonal = delta - parallel
-        calibrated = mean + parallel + self.subspace_shrink * orthogonal
+        calibrated = mean + parallel_tilde + self.subspace_shrink * orthogonal
         return calibrated.to(dtype=projected.dtype)
 
     def project_hidden(self, x, apply_soft_threshold):
@@ -150,16 +162,6 @@ class HiRAAdapter(nn.Module):
             token_features = token_features.float()
             projected = token_features @ self.b_rand.float()
         projected = F.gelu(projected)
-        if apply_soft_threshold and not self.training:
-            projected = apply_mean_centered_soft_threshold(
-                projected,
-                self.soft_threshold_mean,
-                self.soft_threshold_std,
-                alpha=self.soft_threshold_alpha,
-                beta=self.soft_threshold_beta,
-                stat_eps=self.soft_threshold_stat_eps,
-                mode=self.soft_threshold_mode,
-            )
         if not self.training:
             projected = self.apply_clean_subspace_calibration(projected)
         return projected
@@ -278,6 +280,14 @@ def _attach_hira_modules(
                 expansion_dim_current = module.mlp_adapter.clean_subspace_mean.numel()
                 module.mlp_adapter.clean_subspace_basis = torch.zeros(
                     expansion_dim_current,
+                    int(subspace_rank),
+                    dtype=torch.float32,
+                )
+                module.mlp_adapter.clean_subspace_coeff_mean = torch.zeros(
+                    int(subspace_rank),
+                    dtype=torch.float32,
+                )
+                module.mlp_adapter.clean_subspace_coeff_std = torch.ones(
                     int(subspace_rank),
                     dtype=torch.float32,
                 )
@@ -581,21 +591,23 @@ def _build_clean_subspace_basis(entry):
     )
     feature_mean = entry["feature_sum"] / float(entry["feature_sample_count"])
     rp_dim = feature_mean.numel()
+    empty_mean = torch.zeros(requested_rank, dtype=torch.float32)
+    empty_std = torch.ones(requested_rank, dtype=torch.float32)
     if requested_rank <= 0:
-        return feature_mean.float().cpu(), torch.empty(rp_dim, 0, dtype=torch.float32), 0
+        return feature_mean.float().cpu(), torch.empty(rp_dim, 0, dtype=torch.float32), empty_mean, empty_std, 0
     if subspace_rank <= 0:
-        return feature_mean.float().cpu(), torch.zeros(rp_dim, requested_rank, dtype=torch.float32), 0
+        return feature_mean.float().cpu(), torch.zeros(rp_dim, requested_rank, dtype=torch.float32), empty_mean, empty_std, 0
 
     sampled = entry["clean_subspace_samples"][: entry["clean_subspace_sample_count"]].float()
     centered = sampled - feature_mean.float().cpu().view(1, -1)
     if centered.size(0) <= 1:
-        return feature_mean.float().cpu(), torch.zeros(rp_dim, requested_rank, dtype=torch.float32), 0
+        return feature_mean.float().cpu(), torch.zeros(rp_dim, requested_rank, dtype=torch.float32), empty_mean, empty_std, 0
 
     gram = centered @ centered.t()
     eigenvalues, eigenvectors = torch.linalg.eigh(gram)
     positive = eigenvalues > 1e-8
     if int(positive.sum().item()) == 0:
-        return feature_mean.float().cpu(), torch.zeros(rp_dim, requested_rank, dtype=torch.float32), 0
+        return feature_mean.float().cpu(), torch.zeros(rp_dim, requested_rank, dtype=torch.float32), empty_mean, empty_std, 0
 
     valid_rank = min(subspace_rank, int(positive.sum().item()))
     top_values = eigenvalues[positive][-valid_rank:]
@@ -603,11 +615,20 @@ def _build_clean_subspace_basis(entry):
     basis = centered.t() @ top_vectors
     basis = basis / top_values.clamp_min(1e-8).sqrt().unsqueeze(0)
     basis = torch.linalg.qr(basis, mode="reduced").Q.float().cpu()
+    coeff = centered @ basis[:, :valid_rank]
+    coeff_mean = coeff.mean(dim=0).float().cpu()
+    coeff_std = coeff.var(dim=0, unbiased=False).clamp_min(0.0).sqrt().float().cpu()
     if valid_rank < requested_rank:
         padded_basis = torch.zeros(rp_dim, requested_rank, dtype=torch.float32)
         padded_basis[:, :valid_rank] = basis
         basis = padded_basis
-    return feature_mean.float().cpu(), basis, valid_rank
+        padded_coeff_mean = torch.zeros(requested_rank, dtype=torch.float32)
+        padded_coeff_std = torch.ones(requested_rank, dtype=torch.float32)
+        padded_coeff_mean[:valid_rank] = coeff_mean
+        padded_coeff_std[:valid_rank] = coeff_std
+        coeff_mean = padded_coeff_mean
+        coeff_std = padded_coeff_std
+    return feature_mean.float().cpu(), basis, coeff_mean, coeff_std, valid_rank
 
 
 def _project_hira_tokens(source_tokens, b_rand):
@@ -791,9 +812,17 @@ def _accumulate_hira_statistics(
             entry["soft_threshold_mean"] = feature_mean.float().cpu()
             entry["soft_threshold_std"] = feature_var.clamp_min(0.0).sqrt().float().cpu()
             if collect_clean_subspace_stats:
-                clean_subspace_mean, clean_subspace_basis, clean_subspace_valid_rank = _build_clean_subspace_basis(entry)
+                (
+                    clean_subspace_mean,
+                    clean_subspace_basis,
+                    clean_subspace_coeff_mean,
+                    clean_subspace_coeff_std,
+                    clean_subspace_valid_rank,
+                ) = _build_clean_subspace_basis(entry)
                 entry["clean_subspace_mean"] = clean_subspace_mean
                 entry["clean_subspace_basis"] = clean_subspace_basis
+                entry["clean_subspace_coeff_mean"] = clean_subspace_coeff_mean
+                entry["clean_subspace_coeff_std"] = clean_subspace_coeff_std
                 entry["clean_subspace_valid_rank"] = clean_subspace_valid_rank
 
     return statistics
@@ -865,6 +894,8 @@ def _fit_hira_weights_closed_form(
                 wrapper.mlp_adapter.clean_subspace_basis = train_entry["clean_subspace_basis"].to(
                     dtype=torch.float32,
                 )
+                wrapper.mlp_adapter.clean_subspace_coeff_mean.copy_(train_entry["clean_subspace_coeff_mean"])
+                wrapper.mlp_adapter.clean_subspace_coeff_std.copy_(train_entry["clean_subspace_coeff_std"])
                 wrapper.mlp_adapter.clean_subspace_valid_rank.fill_(int(train_entry["clean_subspace_valid_rank"]))
 
         ridge, regression_loss = _select_ridge_by_regression_loss(
@@ -1057,13 +1088,15 @@ def apply_hira_adaptation(
         "noisy_adaptation_target": "noisy_mlp_input" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "original_mlp_input",
         "adaptation_input_source": "noisy_only" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "clean_only",
         "activation": "gelu",
-        "soft_threshold_mean_source": "train_clean_gelu_a_feature_channel",
-        "soft_threshold_stage": "after_gelu_before_b",
+        "soft_threshold_mean_source": "unused_channelwise_projected_threshold",
+        "soft_threshold_stage": "disabled",
         "soft_threshold_train_usage": "disabled",
-        "soft_threshold_eval_usage": "enabled" if is_meansparse_enabled(soft_threshold_alpha) else "disabled",
+        "soft_threshold_eval_usage": "disabled",
         "subspace_mean_source": "train_clean_gelu_a_feature_channel",
         "subspace_basis_source": "train_clean_gelu_a_feature_top_pcs",
-        "subspace_stage": "after_soft_threshold_before_b",
+        "subspace_coeff_mean_source": "unused_pc_tanh_calibration",
+        "subspace_coeff_std_source": "train_clean_pc_coeff_std",
+        "subspace_stage": "after_gelu_before_b",
         "subspace_train_usage": "disabled",
         "subspace_eval_usage": "enabled" if is_hira_subspace_enabled(subspace_rank, subspace_shrink) else "disabled",
         "frozen_b": True,
