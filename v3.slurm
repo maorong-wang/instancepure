@@ -14,18 +14,18 @@ source /home_fmg/maorong/miniconda3/etc/profile.d/conda.sh
 conda activate diffpure 
 
 
-python visualization/transferability_test.py \
+python visualization/pgd_iteration_curves.py \
     --model-name Xu2024MIMIR_Swin-B \
     --data-dir ./dataset/imagenet \
     --model-dir ./robustbench_models \
     --device cuda:0 \
-    --eps-list 0,1/255,2/255,4/255,8/255,16/255 \
-    --pgd-steps 40 \
+    --eps 4/255 \
+    --max-steps 100 \
     --pgd-random-start true \
     --mask-pgd-logits false \
     --num-classes 20 \
     --samples-per-class 50 \
-    --batch-size 16 \
+    --batch-size 32 \
     --num-workers 4 \
     --soft-threshold-mode away_from_mean \
     --soft-threshold-alpha 0.9 \

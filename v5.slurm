@@ -13,8 +13,7 @@
 source /home_fmg/maorong/miniconda3/etc/profile.d/conda.sh
 conda activate diffpure 
 
-
-python visualization/transferability_test.py \
+python visualization/hira_subspace_intervention.py \
     --model-name Xu2024MIMIR_Swin-B \
     --data-dir ./dataset/imagenet \
     --model-dir ./robustbench_models \
@@ -31,4 +30,5 @@ python visualization/transferability_test.py \
     --soft-threshold-alpha 0.9 \
     --soft-threshold-beta 4 \
     --hira-subspace-rank 1024 \
-    --hira-subspace-shrink 0.5
+    --hira-subspace-shrink 1.0
+

@@ -56,11 +56,11 @@ parameters:
     values:
       - swin_b
   use_hira_adapter:
-    values: [false]
+    values: [true]
   hira_expansion_dim:
     value: 16384
   use_ranpac_head:
-    values: [false]
+    values: [true]
   hira_num_blocks:
     value: 4
   hira_batch_size:
@@ -90,16 +90,16 @@ parameters:
   adapt_alpha:
     value: 1.0
   soft_threshold_alpha:
-    value: 0.0
+    value: 0.9
   soft_threshold_beta:
     value: 4.0
   soft_threshold_stat_eps:
     value: 1.0e-6
   soft_threshold_mode:
-    values: ["away_from_mean", "two_pits"]
+    values: ["away_from_mean"]
 
   hira_subspace_rank:
-    value: 128
+    value: 1024
   hira_subspace_shrink:
     value: 0.5
   stability_ridge_gamma:

@@ -13,8 +13,7 @@
 source /home_fmg/maorong/miniconda3/etc/profile.d/conda.sh
 conda activate diffpure 
 
-
-python visualization/transferability_test.py \
+python visualization/hira_subspace_stability.py \
     --model-name Xu2024MIMIR_Swin-B \
     --data-dir ./dataset/imagenet \
     --model-dir ./robustbench_models \
@@ -25,8 +24,9 @@ python visualization/transferability_test.py \
     --mask-pgd-logits false \
     --num-classes 20 \
     --samples-per-class 50 \
-    --batch-size 16 \
+    --batch-size 4 \
     --num-workers 4 \
+    --cka-max-dims 2048 \
     --soft-threshold-mode away_from_mean \
     --soft-threshold-alpha 0.9 \
     --soft-threshold-beta 4 \

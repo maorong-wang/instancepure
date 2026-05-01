@@ -561,6 +561,8 @@ def parse_args():
     parser.add_argument("--soft-threshold-beta", "--soft_threshold_beta", type=float, default=4.0)
     parser.add_argument("--soft-threshold-stat-eps", "--soft_threshold_stat_eps", type=float, default=DEFAULT_MEANSPARSE_STAT_EPS)
     parser.add_argument("--soft-threshold-mode", "--soft_threshold_mode", choices=["near_mean", "away_from_mean"], default="away_from_mean")
+    parser.add_argument("--hira-subspace-rank", "--hira_subspace_rank", type=int, default=0)
+    parser.add_argument("--hira-subspace-shrink", "--hira_subspace_shrink", type=float, default=1.0)
     parser.add_argument("--stability-ridge-gamma", "--stability_ridge_gamma", type=float, default=0.0)
     parser.add_argument("--stability-ridge-stat-eps", "--stability_ridge_stat_eps", type=float, default=DEFAULT_STABILITY_RIDGE_STAT_EPS)
     parser.add_argument("--ranpac-rp-dim", "--ranpac_rp_dim", type=int, default=10000)
@@ -639,6 +641,11 @@ def main():
         "pgd_step_size": args.pgd_step_size,
         "pgd_random_start": args.pgd_random_start,
         "mask_pgd_logits": args.mask_pgd_logits,
+        "soft_threshold_alpha": args.soft_threshold_alpha,
+        "soft_threshold_beta": args.soft_threshold_beta,
+        "soft_threshold_mode": args.soft_threshold_mode,
+        "hira_subspace_rank": args.hira_subspace_rank,
+        "hira_subspace_shrink": args.hira_subspace_shrink,
         "outputs": [
             "transfer_accuracy_vs_eps.png",
             "worst_source_accuracy_vs_eps.png",
