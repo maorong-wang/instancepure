@@ -96,7 +96,8 @@ parameters:
   soft_threshold_stat_eps:
     value: 1.0e-6
   soft_threshold_mode:
-    value: away_from_mean
+    values: ["away_from_mean", "two_pits"]
+
   hira_subspace_rank:
     value: 128
   hira_subspace_shrink:

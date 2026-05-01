@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument("--soft_threshold_alpha", type=float, default=0.0, help="HiRA-only width of the smooth mean-centered threshold in units of hidden-feature std; 0 disables it.")
     parser.add_argument("--soft_threshold_beta", type=float, default=8.0, help="HiRA-only sharpness of the smooth mean-centered threshold.")
     parser.add_argument("--soft_threshold_stat_eps", type=float, default=1e-6, help="HiRA-only minimum hidden-feature std used by the smooth mean-centered threshold.")
-    parser.add_argument("--soft_threshold_mode", type=str, choices=["near_mean", "away_from_mean"], default="away_from_mean", help="HiRA-only inference sparsification target: pull ambiguous hidden features toward the mean or toward the nearest mean +/- alpha*std boundary.")
+    parser.add_argument("--soft_threshold_mode", type=str, choices=["near_mean", "away_from_mean", "two_pits"], default="away_from_mean", help="HiRA-only inference sparsification target.")
     parser.add_argument("--hira_subspace_rank", type=int, default=0, help="HiRA-only clean projected-feature subspace rank; 0 disables clean-subspace calibration.")
     parser.add_argument("--hira_subspace_shrink", type=float, default=1.0, help="HiRA-only shrinkage applied to the residual orthogonal to the clean projected-feature subspace. 1 keeps the residual unchanged.")
     parser.add_argument("--stability_ridge_gamma", type=float, default=0.0, help="Strength of the stability-aware diagonal ridge prior; 0 disables it.")

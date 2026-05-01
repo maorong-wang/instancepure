@@ -6,9 +6,11 @@ import torch
 DEFAULT_MEANSPARSE_STAT_EPS = 1e-6
 MEANSPARSE_MODE_NEAR_MEAN = "near_mean"
 MEANSPARSE_MODE_AWAY_FROM_MEAN = "away_from_mean"
+MEANSPARSE_MODE_TWO_PITS = "two_pits"
 MEANSPARSE_MODES = (
     MEANSPARSE_MODE_NEAR_MEAN,
     MEANSPARSE_MODE_AWAY_FROM_MEAN,
+    MEANSPARSE_MODE_TWO_PITS,
 )
 DEFAULT_MEANSPARSE_MODE = MEANSPARSE_MODE_AWAY_FROM_MEAN
 
@@ -34,6 +36,8 @@ def _build_meansparse_mode_tag(mode):
     mode = validate_meansparse_mode(mode)
     if mode == MEANSPARSE_MODE_NEAR_MEAN:
         return "msmnear"
+    if mode == MEANSPARSE_MODE_TWO_PITS:
+        return "msmtwo"
     return "msmaway"
 
 
@@ -84,8 +88,12 @@ def apply_mean_centered_soft_threshold(
     diff_abs = diff.abs()
     radius = diff_abs / std
     gate = torch.sigmoid(float(beta) * (radius - float(alpha)))
-    del mode
-    boundary = float(alpha) * std
-    boundary_aligned_abs = boundary + gate * (diff_abs - boundary)
-    output = mean + diff.sign() * boundary_aligned_abs
+    if mode == MEANSPARSE_MODE_TWO_PITS:
+        output = x_float - 2.0 * (1 - gate) * std * torch.tanh(diff / std)
+    elif mode == MEANSPARSE_MODE_NEAR_MEAN:
+        output = mean + gate * diff
+    else:
+        boundary = float(alpha) * std
+        boundary_aligned_abs = boundary + gate * (diff_abs - boundary)
+        output = mean + diff.sign() * boundary_aligned_abs
     return output.to(dtype=x.dtype)

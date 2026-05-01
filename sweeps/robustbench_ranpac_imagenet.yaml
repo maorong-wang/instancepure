@@ -1,6 +1,6 @@
 program: eval_robustbench_ranpac.py
 method: grid
-project: robustbench-ranpac-hira-rc-sweep_for_submission_new_sparse
+project: robustbench-ranpac-hira-rc-sweep_for_submission_new_sparse_2pits
 name: robustbench-ranpac-hira-imagenet
 metric:
   name: robust_acc
@@ -83,7 +83,7 @@ parameters:
   soft_threshold_stat_eps:
     value: 1.0e-6
   soft_threshold_mode:
-    values: ["away_from_mean"]
+    values: ["two_pits"]
   hira_subspace_rank:
     values: [1024]
   hira_subspace_shrink:
