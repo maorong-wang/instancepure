@@ -132,18 +132,9 @@ class HiRAAdapter(nn.Module):
         )
         delta = projected_float - mean
         coeff = delta @ basis
-        coeff_std = self.clean_subspace_coeff_std[: int(self.clean_subspace_valid_rank.item())].to(
-            device=projected.device,
-            dtype=torch.float32,
-        ).clamp_min(float(self.soft_threshold_stat_eps)).view(1, -1)
-        coeff_scale = float(self.soft_threshold_alpha) * coeff_std
-        coeff_scale = coeff_scale.clamp_min(float(self.soft_threshold_stat_eps))
-        coeff_tilde = coeff_scale * torch.tanh(coeff / coeff_scale)
-
         parallel = coeff @ basis.t()
-        parallel_tilde = coeff_tilde @ basis.t()
         orthogonal = delta - parallel
-        calibrated = mean + parallel_tilde + self.subspace_shrink * orthogonal
+        calibrated = mean + parallel + self.subspace_shrink * orthogonal
         return calibrated.to(dtype=projected.dtype)
 
     def project_hidden(self, x, apply_soft_threshold):
@@ -162,6 +153,16 @@ class HiRAAdapter(nn.Module):
             token_features = token_features.float()
             projected = token_features @ self.b_rand.float()
         projected = F.gelu(projected)
+        if apply_soft_threshold and not self.training:
+            projected = apply_mean_centered_soft_threshold(
+                projected,
+                self.soft_threshold_mean,
+                self.soft_threshold_std,
+                alpha=self.soft_threshold_alpha,
+                beta=self.soft_threshold_beta,
+                stat_eps=self.soft_threshold_stat_eps,
+                mode=self.soft_threshold_mode,
+            )
         if not self.training:
             projected = self.apply_clean_subspace_calibration(projected)
         return projected
@@ -1088,15 +1089,15 @@ def apply_hira_adaptation(
         "noisy_adaptation_target": "noisy_mlp_input" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "original_mlp_input",
         "adaptation_input_source": "noisy_only" if adapt_noise_num > 0 and adapt_noise_eps > 0 else "clean_only",
         "activation": "gelu",
-        "soft_threshold_mean_source": "unused_channelwise_projected_threshold",
-        "soft_threshold_stage": "disabled",
+        "soft_threshold_mean_source": "train_clean_gelu_a_feature_channel",
+        "soft_threshold_stage": "after_gelu_before_b",
         "soft_threshold_train_usage": "disabled",
-        "soft_threshold_eval_usage": "disabled",
+        "soft_threshold_eval_usage": "enabled" if is_meansparse_enabled(soft_threshold_alpha) else "disabled",
         "subspace_mean_source": "train_clean_gelu_a_feature_channel",
         "subspace_basis_source": "train_clean_gelu_a_feature_top_pcs",
-        "subspace_coeff_mean_source": "unused_pc_tanh_calibration",
-        "subspace_coeff_std_source": "train_clean_pc_coeff_std",
-        "subspace_stage": "after_gelu_before_b",
+        "subspace_coeff_mean_source": "unused_pc_orthogonal_shrink",
+        "subspace_coeff_std_source": "unused_pc_orthogonal_shrink",
+        "subspace_stage": "after_soft_threshold_before_b",
         "subspace_train_usage": "disabled",
         "subspace_eval_usage": "enabled" if is_hira_subspace_enabled(subspace_rank, subspace_shrink) else "disabled",
         "frozen_b": True,

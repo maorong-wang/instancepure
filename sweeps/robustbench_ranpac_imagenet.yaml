@@ -77,9 +77,9 @@ parameters:
   adapt_alpha:
     value: 1
   soft_threshold_alpha:
-    values: [1.5]
+    values: [.9]
   soft_threshold_beta:
-    values: [16.0]
+    values: [4.0]
   soft_threshold_stat_eps:
     value: 1.0e-6
   soft_threshold_mode:
@@ -87,7 +87,7 @@ parameters:
   hira_subspace_rank:
     values: [1024]
   hira_subspace_shrink:
-    values: [0.5]
+    values: [.5]
   stability_ridge_gamma:
     values: [0.0]
   stability_ridge_stat_eps:
