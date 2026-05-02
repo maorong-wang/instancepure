@@ -37,7 +37,7 @@ def build_purifier(args, device):
             pretrained_root=getattr(
                 args,
                 "guided_diffusion_pretrained_root",
-                "/home_fmg/maorong/python/DiffPure/pretrained",
+                "pretrained",
             ),
             checkpoint_path=getattr(args, "guided_diffusion_checkpoint_path", None),
             use_fp16=getattr(args, "guided_diffusion_use_fp16", False),
@@ -58,7 +58,7 @@ def build_purifier(args, device):
             pretrained_root=getattr(
                 args,
                 "guided_diffusion_pretrained_root",
-                "/home_fmg/maorong/python/DiffPure/pretrained",
+                "pretrained",
             ),
             checkpoint_path=getattr(args, "guided_diffusion_checkpoint_path", None),
             use_fp16=getattr(args, "guided_diffusion_use_fp16", False),

@@ -81,7 +81,7 @@ class DiffPureConfig:
     rand_t: bool = False
     t_delta: int = 15
     use_brownian: bool = False
-    pretrained_root: str = "/home_fmg/maorong/python/DiffPure/pretrained"
+    pretrained_root: str = "pretrained"
     checkpoint_path: Optional[str] = None
     use_fp16: bool = True
 

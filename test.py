@@ -86,7 +86,7 @@ def parse_args():
     parser.add_argument("--eps", type=int, default=4, help="Attack epsilon in pixel-space units out of 255.")
     parser.add_argument("--diffusion_respace", type=str, default="ddim50", help="Guided diffusion timestep respacing used by the InstantPure backend.")
     parser.add_argument("--diffusion_timestep", type=int, default=150, help="Guided diffusion timestep used by the current SDEdit-based diffusion attack backend.")
-    parser.add_argument("--guided_diffusion_pretrained_root", type=str, default="/home_fmg/maorong/python/DiffPure/pretrained", help="Root directory containing the shared ImageNet guided-diffusion checkpoint used by DiffPure and MimicDiffusion.")
+    parser.add_argument("--guided_diffusion_pretrained_root", type=str, default="pretrained", help="Root directory containing the shared ImageNet guided-diffusion checkpoint used by DiffPure and MimicDiffusion.")
     parser.add_argument("--guided_diffusion_checkpoint_path", type=str, default="", help="Optional explicit path to the ImageNet guided-diffusion checkpoint; overrides --guided_diffusion_pretrained_root.")
     parser.add_argument("--guided_diffusion_use_fp16", type=str2bool, default=True, help="Load the shared ImageNet guided-diffusion purifier backbone in fp16.")
     parser.add_argument("--diffpure_diffusion_type", type=str, choices=["ddpm", "sde"], default="sde", help="DiffPure backend variant. The original ImageNet code path uses sde; ddpm is a dependency-light fallback.")

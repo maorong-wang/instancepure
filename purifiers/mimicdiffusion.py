@@ -43,7 +43,7 @@ class MimicDiffusionConfig:
     guidance_start_step: int = 20
     guidance_end_step: int = 90
     projection_scale: int = 4
-    pretrained_root: str = "/home_fmg/maorong/python/DiffPure/pretrained"
+    pretrained_root: str = "pretrained"
     checkpoint_path: Optional[str] = None
     use_fp16: bool = True
 

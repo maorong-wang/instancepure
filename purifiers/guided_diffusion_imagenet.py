@@ -5,23 +5,64 @@ import torch
 from guided_diffusion.script_util import create_model_and_diffusion, model_and_diffusion_defaults
 
 
-DEFAULT_GUIDED_DIFFUSION_PRETRAINED_ROOT = Path("/home_fmg/maorong/python/DiffPure/pretrained")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_GUIDED_DIFFUSION_PRETRAINED_ROOT = REPO_ROOT / "pretrained"
 DEFAULT_GUIDED_DIFFUSION_CHECKPOINT_RELATIVE = Path("guided_diffusion/256x256_diffusion_uncond.pt")
+DEFAULT_GUIDED_DIFFUSION_CHECKPOINT_BASENAME = Path("256x256_diffusion_uncond.pt")
+
+
+def _dedupe_paths(paths):
+    unique_paths = []
+    seen = set()
+    for path in paths:
+        resolved = str(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_paths.append(path)
+    return unique_paths
+
+
+def _build_guided_diffusion_candidates(pretrained_root=None, checkpoint_path=None):
+    if checkpoint_path:
+        return [Path(checkpoint_path).expanduser()]
+
+    candidate_roots = []
+    if pretrained_root:
+        candidate_roots.append(Path(pretrained_root).expanduser())
+    candidate_roots.append(DEFAULT_GUIDED_DIFFUSION_PRETRAINED_ROOT)
+    candidate_roots = _dedupe_paths(candidate_roots)
+
+    candidates = []
+    for root in candidate_roots:
+        if root.suffix == ".pt":
+            candidates.append(root)
+            continue
+        candidates.append(root / DEFAULT_GUIDED_DIFFUSION_CHECKPOINT_RELATIVE)
+        candidates.append(root / DEFAULT_GUIDED_DIFFUSION_CHECKPOINT_BASENAME)
+    return _dedupe_paths(candidates)
 
 
 def resolve_guided_diffusion_checkpoint(pretrained_root=None, checkpoint_path=None):
+    candidate_paths = _build_guided_diffusion_candidates(
+        pretrained_root=pretrained_root,
+        checkpoint_path=checkpoint_path,
+    )
+    for resolved_path in candidate_paths:
+        if resolved_path.is_file():
+            return resolved_path
+
+    searched = ", ".join(str(path) for path in candidate_paths)
     if checkpoint_path:
-        resolved_path = Path(checkpoint_path).expanduser()
-    else:
-        resolved_root = Path(pretrained_root or DEFAULT_GUIDED_DIFFUSION_PRETRAINED_ROOT).expanduser()
-        resolved_path = resolved_root / DEFAULT_GUIDED_DIFFUSION_CHECKPOINT_RELATIVE
-    if not resolved_path.is_file():
         raise FileNotFoundError(
             "Could not find the ImageNet guided-diffusion checkpoint at "
-            f"{resolved_path}. Pass --guided_diffusion_checkpoint_path or "
-            "--guided_diffusion_pretrained_root."
+            f"{searched}. Pass a valid --guided_diffusion_checkpoint_path."
         )
-    return resolved_path
+    raise FileNotFoundError(
+        "Could not find the ImageNet guided-diffusion checkpoint. Checked: "
+        f"{searched}. Pass --guided_diffusion_checkpoint_path or "
+        "--guided_diffusion_pretrained_root."
+    )
 
 
 def build_imagenet_guided_diffusion_config(use_fp16=True, timestep_respacing="1000"):
