@@ -20,6 +20,8 @@ def build_purifier(args, device):
             control_scale=getattr(args, "control_scale", 0.8),
             diffusion_respace=getattr(args, "diffusion_respace", "ddim50"),
             diffusion_timestep=getattr(args, "diffusion_timestep", 150),
+            guided_diffusion_pretrained_root=getattr(args, "guided_diffusion_pretrained_root", "pretrained"),
+            guided_diffusion_checkpoint_path=getattr(args, "guided_diffusion_checkpoint_path", None),
         )
         return InstantPurePurifier(config, device=device)
 

@@ -25,6 +25,8 @@ class InstantPureConfig:
     control_scale: float = 0.8
     diffusion_respace: str = "ddim50"
     diffusion_timestep: int = 150
+    guided_diffusion_pretrained_root: str = "pretrained"
+    guided_diffusion_checkpoint_path: Optional[str] = None
     controlnet_model_name: str = "lllyasviel/sd-controlnet-canny"
     sd_model_name: str = "runwayml/stable-diffusion-v1-5"
 
@@ -40,6 +42,8 @@ class InstantPurePurifier(BasePurifier):
         self.diffusion_model, self.diffusion = get_imagenet_dm_conf(
             device=self.device,
             respace=config.diffusion_respace,
+            model_path=config.guided_diffusion_checkpoint_path,
+            pretrained_root=config.guided_diffusion_pretrained_root,
         )
         self.pipe = self._build_pipe()
 

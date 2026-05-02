@@ -23,9 +23,16 @@ from argparse import Namespace
 import time
 import datetime
 from utils import *
+from purifiers.guided_diffusion_imagenet import resolve_guided_diffusion_checkpoint
 
-def get_imagenet_dm_conf(class_cond=False, respace="", device='cuda',
-                         model_path='/home_fmg/maorong/python/DiffPure/pretrained/guided_diffusion/256x256_diffusion_uncond.pt'):
+
+def get_imagenet_dm_conf(
+    class_cond=False,
+    respace="",
+    device="cuda",
+    model_path=None,
+    pretrained_root=None,
+):
 
     defaults = dict(
         clip_denoised=True,
@@ -63,8 +70,12 @@ def get_imagenet_dm_conf(class_cond=False, respace="", device='cuda',
     
     
     # load ckpt
-    
-    ckpt = th.load(model_path)
+
+    resolved_model_path = resolve_guided_diffusion_checkpoint(
+        pretrained_root=pretrained_root,
+        checkpoint_path=model_path,
+    )
+    ckpt = th.load(resolved_model_path)
     model.load_state_dict(ckpt)
     model = model.to(device)
     
@@ -72,7 +83,6 @@ def get_imagenet_dm_conf(class_cond=False, respace="", device='cuda',
     cprint('Load DM Ckpt      ---------------', 'y')
     
     return model, diffusion
-
 
 
 
