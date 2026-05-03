@@ -65,7 +65,7 @@ DEFAULT_EPS = {
 }
 
 OFFICIAL_AUTOATTACK_VERSIONS = {"standard"}
-CUSTOM_AUTOATTACK_VERSIONS = {"rand", "full", "apgdt"}
+CUSTOM_AUTOATTACK_VERSIONS = {"rand", "full", "apgdt", "square"}
 
 
 def str2bool(v):
@@ -177,7 +177,7 @@ def parse_args():
         "--autoattack-version",
         "--autoattack_version",
         default="standard",
-        help="AutoAttack mode. Use 'standard' for official RobustBench benchmark(), 'full' for local APGD-CE/APGD-DLR/FAB/Square, 'rand' for local APGD-CE/APGD-DLR, or 'apgdt' for local APGD-T with RobustBench-standard targeted settings.",
+        help="AutoAttack mode. Use 'standard' for official RobustBench benchmark(), 'full' for local APGD-CE/APGD-DLR/FAB/Square, 'rand' for local APGD-CE/APGD-DLR, 'square' for Square-only, or 'apgdt' for local APGD-T with RobustBench-standard targeted settings.",
     )
     parser.add_argument(
         "--autoattack-eot-iter",
@@ -638,6 +638,8 @@ def evaluate_autoattack_custom(model, loader, device, norm, eps, version, eot_it
         adversary.apgd.eot_iter = eot_iter
     elif version == "full":
         adversary.attacks_to_run = ["apgd-ce", "apgd-t", "fab-t", "square"]
+    elif version == "square":
+        adversary.attacks_to_run = ["square"]
     elif version == "apgdt":
         adversary.attacks_to_run = ["apgd-t"]
         if norm in {"Linf", "L2"}:
@@ -695,7 +697,7 @@ def evaluate_variant(model, variant_name, benchmark_model_name, loader, attacks,
         else:
             raise ValueError(
                 f"Unsupported autoattack version '{args.autoattack_version}'. "
-                "Use one of: standard, full, rand, apgdt."
+                "Use one of: standard, full, rand, square, apgdt."
             )
         metrics["clean_acc"] = clean_acc
         metrics["autoattack_robust_acc"] = autoattack_robust_acc

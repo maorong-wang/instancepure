@@ -147,6 +147,11 @@ def parse_eps_list(value):
     return [parse_float_or_fraction(item.strip()) for item in str(value).split(",") if item.strip()]
 
 
+def build_eps_tag(eps_values):
+    eps_pixels = [eps * 255.0 for eps in eps_values]
+    return f"n{len(eps_values)}_min{sanitize_name(min(eps_pixels))}_max{sanitize_name(max(eps_pixels))}"
+
+
 def pgd_linf_attack(model, inputs, targets, eps, steps, step_size, random_start, attack_class_ids=None):
     if eps <= 0 or steps <= 0:
         return inputs.detach()
@@ -1140,7 +1145,7 @@ def main():
 
     run_name = args.run_name
     if not run_name:
-        eps_tag = sanitize_name(args.eps_list)
+        eps_tag = build_eps_tag(eps_values)
         run_name = f"{sanitize_name(args.model_name)}_classes{len(selected_class_ids)}_n{args.samples_per_class}_eps{eps_tag}_seed{args.seed}"
     run_dir = Path(args.output_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)

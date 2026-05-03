@@ -56,6 +56,11 @@ def parse_eps_list(value):
     return [parse_float_or_fraction(item.strip()) for item in str(value).split(",") if item.strip()]
 
 
+def build_eps_tag(eps_values):
+    eps_pixels = [eps * 255.0 for eps in eps_values]
+    return f"n{len(eps_values)}_min{sanitize_name(min(eps_pixels))}_max{sanitize_name(max(eps_pixels))}"
+
+
 def top_logit_normalized_margin_torch(logits, labels, eps=1e-12):
     true_logits = logits.gather(1, labels.view(-1, 1)).squeeze(1)
     masked = logits.clone()
@@ -601,7 +606,7 @@ def main():
     args.attack_class_ids = selected_class_ids if args.mask_pgd_logits else None
     loader = build_eval_loader(dataset, selected_indices, args.batch_size, args.num_workers)
 
-    eps_name = sanitize_name("-".join(str(eps) for eps in eps_values))
+    eps_name = build_eps_tag(eps_values)
     run_name = args.run_name or f"{sanitize_name(args.model_name)}_classes{len(selected_class_ids)}_n{args.samples_per_class}_eps{eps_name}_steps{args.pgd_steps}_seed{args.seed}"
     run_dir = Path(args.output_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)

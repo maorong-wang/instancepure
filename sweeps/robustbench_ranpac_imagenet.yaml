@@ -1,6 +1,6 @@
 program: eval_robustbench_ranpac.py
 method: grid
-project: robustbench-ranpac-hira-rc-sweep_for_submission_new_sparse_2pits
+project: robustbench-ranpac-hira-rc-ablation_calib
 name: robustbench-ranpac-hira-imagenet
 metric:
   name: robust_acc
@@ -16,14 +16,14 @@ parameters:
     value: ./robustbench_models
   model_names:
     values:
-      - Xu2024MIMIR_Swin-L 
+      # - Xu2024MIMIR_Swin-L 
       - Xu2024MIMIR_Swin-B 
-      - Liu2023Comprehensive_Swin-L 
-      - Liu2023Comprehensive_Swin-B 
+      # - Liu2023Comprehensive_Swin-L 
+      # - Liu2023Comprehensive_Swin-B 
       - Singh2023Revisiting_ViT-B-ConvStem
-      - Singh2023Revisiting_ViT-S-ConvStem
-      - RodriguezMunoz2024Characterizing_Swin-L
-      - RodriguezMunoz2024Characterizing_Swin-B
+      # - Singh2023Revisiting_ViT-S-ConvStem
+      # - RodriguezMunoz2024Characterizing_Swin-L
+      # - RodriguezMunoz2024Characterizing_Swin-B
   use_hira:
     values: [true]
   use_ranpac:
@@ -45,7 +45,7 @@ parameters:
   pgd_random_start:
     value: true
   autoattack_version:
-    values: [standard]
+    values: [square]
   hira_expansion_dim:
     values: [16384]
   hira_num_blocks:
