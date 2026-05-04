@@ -35,7 +35,7 @@ from classifiers.ranpac import (
     _iter_ranpac_cache_candidate_paths,
 )
 from purifiers import PurifiedClassifier, build_purifier
-from victims import apply_victim_wrappers, build_imagenet_victim, build_wrapper_config_from_namespace, supports_hira
+from victims import build_imagenet_victim, build_wrapper_config_from_namespace, supports_hira
 from visualization.tsne_robustbench_ranpac import (
     DATASET,
     build_imagenet_dataset,
@@ -294,23 +294,13 @@ def build_classifier(args, classifier_name, use_ours, device):
         wrapper_args.use_hira_adapter = True
         wrapper_args.use_ranpac_head = True
         wrapper_config = build_wrapper_config_from_namespace(wrapper_args, dataset="imagenet")
-        if args.random_init_missing_wrappers:
-            classifier, wrapped_name, hira_cache_loaded, ranpac_cache_loaded = apply_wrappers_cache_or_random(
-                classifier,
-                base_classifier_name,
-                victim_spec,
-                wrapper_config,
-            )
-            wrapper_source = "cache_or_random"
-        else:
-            classifier, wrapped_name = apply_victim_wrappers(
-                classifier,
-                classifier_name=base_classifier_name,
-                supports_hira_arch=supports_hira(victim_spec),
-                config=wrapper_config,
-                device=device,
-            )
-            wrapper_source = "cache_or_fit"
+        classifier, wrapped_name, hira_cache_loaded, ranpac_cache_loaded = apply_wrappers_cache_or_random(
+            classifier,
+            base_classifier_name,
+            victim_spec,
+            wrapper_config,
+        )
+        wrapper_source = "cache_or_random"
     else:
         wrapped_name = base_classifier_name
     return classifier.to(device).eval(), wrapped_name, victim_spec, wrapper_source, hira_cache_loaded, ranpac_cache_loaded
@@ -412,7 +402,7 @@ def add_common_args(parser):
     parser.add_argument("--purifier-classifier", "--purifier_classifier", default="vit_base", help="Victim backbone used behind purifier pipelines.")
     parser.add_argument("--purifiers", default="mimicdiffusion,instantpure", help="Comma-separated purifier names to time with --purifier-classifier.")
     parser.add_argument("--variants", default="baseline,ours", choices=None, help="Comma-separated variants: baseline,ours.")
-    parser.add_argument("--random-init-missing-wrappers", "--random_init_missing_wrappers", type=str2bool, default=True, help="For timing only, do not fit missing HiRA/RanPAC caches; use random wrapper weights instead.")
+    parser.add_argument("--random-init-missing-wrappers", "--random_init_missing_wrappers", type=str2bool, default=True, help="Legacy no-op. Timing never fits missing HiRA/RanPAC caches and always falls back to random wrapper weights.")
 
 
 def add_wrapper_args(parser):
