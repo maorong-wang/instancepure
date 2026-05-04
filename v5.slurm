@@ -22,8 +22,8 @@ python visualization/hira_subspace_intervention.py \
     --pgd-steps 40 \
     --pgd-random-start true \
     --mask-pgd-logits false \
-    --num-classes 20 \
-    --samples-per-class 50 \
+    --num-classes 1000 \
+    --samples-per-class 5 \
     --batch-size 16 \
     --num-workers 4 \
     --soft-threshold-mode away_from_mean \

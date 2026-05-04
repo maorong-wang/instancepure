@@ -7,7 +7,7 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=25G
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 
 
 source /home_fmg/maorong/miniconda3/etc/profile.d/conda.sh
@@ -23,8 +23,8 @@ python visualization/explain_robustbench_ranpac.py \
     --pgd-steps 40 \
     --pgd-random-start true \
     --mask-pgd-logits false \
-    --num-classes 20 \
-    --samples-per-class 50 \
+    --num-classes 1000 \
+    --samples-per-class 5 \
     --batch-size 32 \
     --num-workers 4 \
     --soft-threshold-mode away_from_mean \

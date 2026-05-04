@@ -15,7 +15,7 @@ conda activate diffpure
 
 
 python visualization/gradient_dynamics.py \
-    --model-name Xu2024MIMIR_Swin-B \
+    --model-name Xu2024MIMIR_Swin-L \
     --data-dir ./dataset/imagenet \
     --model-dir ./robustbench_models \
     --device cuda:0 \
@@ -24,8 +24,8 @@ python visualization/gradient_dynamics.py \
     --pgd-random-start true \
     --mask-pgd-logits false \
     --shared-path-source original \
-    --num-classes 20 \
-    --samples-per-class 50 \
+    --num-classes 1000 \
+    --samples-per-class 5 \
     --batch-size 16 \
     --num-workers 4 \
     --soft-threshold-mode away_from_mean \

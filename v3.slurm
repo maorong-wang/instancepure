@@ -23,8 +23,8 @@ python visualization/pgd_iteration_curves.py \
     --max-steps 100 \
     --pgd-random-start true \
     --mask-pgd-logits false \
-    --num-classes 20 \
-    --samples-per-class 50 \
+    --num-classes 1000 \
+    --samples-per-class 5 \
     --batch-size 32 \
     --num-workers 4 \
     --soft-threshold-mode away_from_mean \

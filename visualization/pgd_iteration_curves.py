@@ -34,12 +34,11 @@ from visualization.tsne_robustbench_ranpac import (
     freeze_model,
     load_robustbench_model,
     mask_logits_to_classes,
-    parse_class_ids,
     parse_float_or_fraction,
     resolve_device,
     resolve_model_preprocessing,
     sanitize_name,
-    select_balanced_indices,
+    select_all_indices,
     set_seed,
     str2bool,
 )
@@ -239,14 +238,15 @@ def parse_args():
     parser.add_argument("--num-workers", "--num_workers", type=int, default=4, help="DataLoader workers.")
     parser.add_argument("--output-dir", "--output_dir", default="visualization/pgd_iteration_outputs", help="Directory where outputs are saved.")
     parser.add_argument("--run-name", "--run_name", default="", help="Optional output subdirectory name.")
-    parser.add_argument("--num-classes", "--num_classes", type=int, default=20, help="Number of ImageNet classes to sample when --class-ids is empty.")
-    parser.add_argument("--samples-per-class", "--samples_per_class", type=int, default=50, help="Number of validation images per selected class.")
-    parser.add_argument("--class-ids", "--class_ids", default="", help="Optional comma-separated ImageNet class IDs.")
+    parser.add_argument("--eval-examples", "--eval_examples", type=int, default=5000, help="Number of RobustBench ImageNet evaluation examples to load.")
+    parser.add_argument("--num-classes", "--num_classes", type=int, default=20, help="Deprecated; visualization now uses the RobustBench evaluation subset.")
+    parser.add_argument("--samples-per-class", "--samples_per_class", type=int, default=50, help="Deprecated; visualization now uses --eval-examples.")
+    parser.add_argument("--class-ids", "--class_ids", default="", help="Deprecated; visualization now uses the loaded RobustBench classes.")
     parser.add_argument("--eps", type=parse_float_or_fraction, default=4.0 / 255.0, help="Linf PGD epsilon; accepts fractions like 4/255.")
     parser.add_argument("--max-steps", "--max_steps", type=int, default=100, help="Maximum PGD iterations to trace.")
     parser.add_argument("--pgd-step-size", "--pgd_step_size", type=parse_float_or_fraction, default=None, help="Optional PGD step size. Defaults to 2 * eps / max_steps.")
     parser.add_argument("--pgd-random-start", "--pgd_random_start", type=str2bool, default=True, help="Use random-start PGD.")
-    parser.add_argument("--mask-pgd-logits", "--mask_pgd_logits", type=str2bool, default=False, help="During PGD, set logits outside selected classes to -inf.")
+    parser.add_argument("--mask-pgd-logits", "--mask_pgd_logits", type=str2bool, default=False, help="During PGD, set logits outside loaded RobustBench subset classes to -inf.")
 
     parser.add_argument("--hira-expansion-dim", "--hira_expansion_dim", type=int, default=16384)
     parser.add_argument("--hira-num-blocks", "--hira_num_blocks", type=int, default=4)
@@ -291,22 +291,17 @@ def main():
     set_seed(args.seed)
     device = resolve_device(args.device)
     model_preprocessing = resolve_model_preprocessing(args.model_name, args.threat_model)
-    dataset = build_imagenet_dataset(args.data_dir, model_preprocessing)
-    selected_indices, selected_class_ids = select_balanced_indices(
-        dataset,
-        num_classes=args.num_classes,
-        samples_per_class=args.samples_per_class,
-        seed=args.seed,
-        class_ids=parse_class_ids(args.class_ids),
-    )
+    dataset = build_imagenet_dataset(args.data_dir, model_preprocessing, n_examples=args.eval_examples)
+    selected_indices, selected_class_ids = select_all_indices(dataset)
     args.attack_class_ids = selected_class_ids if args.mask_pgd_logits else None
     loader = build_eval_loader(dataset, selected_indices, args.batch_size, args.num_workers)
 
-    run_name = args.run_name or f"{sanitize_name(args.model_name)}_classes{len(selected_class_ids)}_n{args.samples_per_class}_eps{sanitize_name(args.eps)}_steps{args.max_steps}_seed{args.seed}"
+    run_name = args.run_name or f"{sanitize_name(args.model_name)}_examples{len(selected_indices)}_eps{sanitize_name(args.eps)}_steps{args.max_steps}_seed{args.seed}"
     run_dir = Path(args.output_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Saving PGD iteration outputs to: {run_dir}")
-    print(f"Selected classes: {selected_class_ids}")
+    print(f"Loaded RobustBench examples: {len(selected_indices)}")
+    print(f"Loaded classes: {selected_class_ids}")
 
     aggregate_rows = []
     first_success_rows = []
@@ -336,8 +331,10 @@ def main():
         "model_name": args.model_name,
         "dataset": DATASET,
         "threat_model": args.threat_model,
+        "eval_examples": args.eval_examples,
         "selected_class_ids": selected_class_ids,
-        "samples_per_class": args.samples_per_class,
+        "num_samples": len(selected_indices),
+        "num_classes": len(selected_class_ids),
         "eps": args.eps,
         "eps_pixel": args.eps * 255.0,
         "max_steps": args.max_steps,

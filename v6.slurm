@@ -18,12 +18,11 @@ python visualization/hira_subspace_stability.py \
     --data-dir ./dataset/imagenet \
     --model-dir ./robustbench_models \
     --device cuda:0 \
-    --eps-list 0,1/255,2/255,3/255,4/255,5/255,6/255,7/255,8/255,9/255,10/255,11/255,12/255,13/255,14/255,15/255,16/255 \
+    --eps-list 0,2/255,4/255,6/255,8/255,10/255,12/255,14/255,16/255 \
     --pgd-steps 40 \
     --pgd-random-start true \
     --mask-pgd-logits false \
-    --num-classes 20 \
-    --samples-per-class 50 \
+    --eval-examples 1000 \
     --batch-size 4 \
     --num-workers 4 \
     --cka-max-dims 2048 \

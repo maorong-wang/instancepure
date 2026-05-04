@@ -42,12 +42,11 @@ from visualization.tsne_robustbench_ranpac import (
     freeze_model,
     load_robustbench_model,
     mask_logits_to_classes,
-    parse_class_ids,
     parse_float_or_fraction,
     resolve_device,
     resolve_model_preprocessing,
     sanitize_name,
-    select_balanced_indices,
+    select_all_indices,
     set_seed,
     str2bool,
 )
@@ -1070,15 +1069,16 @@ def parse_args():
     parser.add_argument("--output-dir", "--output_dir", default="visualization/explanation_outputs", help="Directory where figures and metrics are saved.")
     parser.add_argument("--run-name", "--run_name", default="", help="Optional output subdirectory name.")
 
-    parser.add_argument("--num-classes", "--num_classes", type=int, default=20, help="Number of ImageNet classes to sample when --class-ids is empty.")
-    parser.add_argument("--samples-per-class", "--samples_per_class", type=int, default=50, help="Number of validation images per selected class.")
-    parser.add_argument("--class-ids", "--class_ids", default="", help="Optional comma-separated ImageNet class IDs. Overrides --num-classes.")
+    parser.add_argument("--eval-examples", "--eval_examples", type=int, default=5000, help="Number of RobustBench ImageNet evaluation examples to load.")
+    parser.add_argument("--num-classes", "--num_classes", type=int, default=20, help="Deprecated; visualization now uses the RobustBench evaluation subset.")
+    parser.add_argument("--samples-per-class", "--samples_per_class", type=int, default=50, help="Deprecated; visualization now uses --eval-examples.")
+    parser.add_argument("--class-ids", "--class_ids", default="", help="Deprecated; visualization now uses the loaded RobustBench classes.")
 
     parser.add_argument("--eps-list", "--eps_list", default="0,1/255,2/255,4/255,8/255,16/255", help="Comma-separated Linf PGD eps values; accepts fractions like 4/255.")
     parser.add_argument("--pgd-steps", "--pgd_steps", type=int, default=40, help="PGD steps for nonzero eps.")
     parser.add_argument("--pgd-step-size", "--pgd_step_size", type=parse_float_or_fraction, default=None, help="Optional PGD step size. Defaults to 2 * eps / steps for each eps.")
     parser.add_argument("--pgd-random-start", "--pgd_random_start", type=str2bool, default=True, help="Use random-start Linf PGD.")
-    parser.add_argument("--mask-pgd-logits", "--mask_pgd_logits", type=str2bool, default=False, help="During PGD, set logits outside selected classes to -inf. Defaults to false for full-class attacks.")
+    parser.add_argument("--mask-pgd-logits", "--mask_pgd_logits", type=str2bool, default=False, help="During PGD, set logits outside loaded RobustBench subset classes to -inf. Defaults to false for full-class attacks.")
     parser.add_argument("--normalize-analysis-features", "--normalize_analysis_features", type=str2bool, default=True, help="L2-normalize features for centroid and kNN analyses.")
     parser.add_argument("--knn-k", "--knn_k", type=int, default=10, help="k used by clean-feature kNN preservation analysis.")
     parser.add_argument("--mi-bins", "--mi_bins", type=int, default=20, help="Number of bins per dimension for clean/adversarial feature mutual information.")
@@ -1131,28 +1131,22 @@ def main():
     set_seed(args.seed)
     device = resolve_device(args.device)
     model_preprocessing = resolve_model_preprocessing(args.model_name, args.threat_model)
-    dataset = build_imagenet_dataset(args.data_dir, model_preprocessing)
-    class_ids_arg = parse_class_ids(args.class_ids)
-    selected_indices, selected_class_ids = select_balanced_indices(
-        dataset,
-        num_classes=args.num_classes,
-        samples_per_class=args.samples_per_class,
-        seed=args.seed,
-        class_ids=class_ids_arg,
-    )
+    dataset = build_imagenet_dataset(args.data_dir, model_preprocessing, n_examples=args.eval_examples)
+    selected_indices, selected_class_ids = select_all_indices(dataset)
     args.attack_class_ids = selected_class_ids if args.mask_pgd_logits else None
     loader = build_eval_loader(dataset, selected_indices, args.batch_size, args.num_workers)
 
     run_name = args.run_name
     if not run_name:
         eps_tag = build_eps_tag(eps_values)
-        run_name = f"{sanitize_name(args.model_name)}_classes{len(selected_class_ids)}_n{args.samples_per_class}_eps{eps_tag}_seed{args.seed}"
+        run_name = f"{sanitize_name(args.model_name)}_examples{len(selected_indices)}_eps{eps_tag}_seed{args.seed}"
     run_dir = Path(args.output_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Saving explanatory outputs to: {run_dir}")
-    print(f"Selected classes: {selected_class_ids}")
+    print(f"Loaded RobustBench examples: {len(selected_indices)}")
+    print(f"Loaded classes: {selected_class_ids}")
     if args.attack_class_ids is not None:
-        print("PGD logit mask enabled: attacking only among selected classes.")
+        print("PGD logit mask enabled: attacking only among loaded RobustBench subset classes.")
     print("Loading original RobustBench model...")
     original_model = freeze_model(load_robustbench_model(args.model_name, args.threat_model, args.model_dir, device))
     original_probe = OriginalProbe(original_model)
@@ -1213,8 +1207,10 @@ def main():
         "model_name": args.model_name,
         "dataset": DATASET,
         "threat_model": args.threat_model,
+        "eval_examples": args.eval_examples,
         "selected_class_ids": selected_class_ids,
-        "samples_per_class": args.samples_per_class,
+        "num_samples": len(selected_indices),
+        "num_classes": len(selected_class_ids),
         "eps_values": eps_values,
         "eps_pixels": eps_to_pixel(eps_values).tolist(),
         "pgd_steps": args.pgd_steps,
