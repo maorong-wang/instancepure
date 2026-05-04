@@ -13,6 +13,7 @@ IMAGENET_MODEL = (
     "vit_tiny",
     "swin_s",
     "swin_b",
+    "swin_l",
     "convnext_b",
 )
 
@@ -47,6 +48,12 @@ _IMAGENET_ALIASES = {
     "swin-base": ("swin_b", "swin_base_patch4_window7_224", "ImageNet Swin-B"),
     "swin_base": ("swin_b", "swin_base_patch4_window7_224", "ImageNet Swin-B"),
     "imagenet-swin-base": ("swin_b", "swin_base_patch4_window7_224", "ImageNet Swin-B"),
+    "swin_l": ("swin_l", "swin_large_patch4_window7_224", "ImageNet Swin-L"),
+    "swin-l": ("swin_l", "swin_large_patch4_window7_224", "ImageNet Swin-L"),
+    "swin_large": ("swin_l", "swin_large_patch4_window7_224", "ImageNet Swin-L"),
+    "swin-large": ("swin_l", "swin_large_patch4_window7_224", "ImageNet Swin-L"),
+    "imagenet-swin-l": ("swin_l", "swin_large_patch4_window7_224", "ImageNet Swin-L"),
+    "imagenet-swin-large": ("swin_l", "swin_large_patch4_window7_224", "ImageNet Swin-L"),
     "convnext_b": ("convnext_b", "convnext_base", "ImageNet ConvNeXt-Base"),
     "convnext-base": ("convnext_b", "convnext_base", "ImageNet ConvNeXt-Base"),
     "imagenet-convnext-base": ("convnext_b", "convnext_base", "ImageNet ConvNeXt-Base"),

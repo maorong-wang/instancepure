@@ -10,6 +10,7 @@ scripts, and compares each backbone/purifier with and without HiRA+RanPAC.
 import argparse
 import csv
 import json
+import math
 import os
 import sys
 import time
@@ -110,6 +111,19 @@ def make_variant_args(args, classifier, purifier_name, use_ours):
     namespace.purifier_name = purifier_name
     namespace.use_hira_adapter = bool(use_ours)
     namespace.use_ranpac_head = bool(use_ours)
+    if str(purifier_name).lower() == "instantpure":
+        strength = float(namespace.strength)
+        num_steps = int(namespace.num_inference_step)
+        if strength <= 0:
+            raise ValueError("InstantPure strength must be positive.")
+        if int(num_steps * strength) < 1:
+            adjusted_steps = max(num_steps, int(math.ceil(1.0 / strength)))
+            print(
+                "InstantPure img2img would use zero denoising steps with "
+                f"num_inference_step={num_steps}, strength={strength}; "
+                f"using num_inference_step={adjusted_steps} for timing."
+            )
+            namespace.num_inference_step = adjusted_steps
     return namespace
 
 
@@ -328,7 +342,7 @@ def time_model(model, loader, device, args, variant_name):
     total_samples = 0
 
     reset_cuda_peak_memory(device)
-    with torch.inference_mode():
+    with torch.no_grad():
         if warmup_batches > 0:
             warmup_progress = tqdm(
                 enumerate(loader),
