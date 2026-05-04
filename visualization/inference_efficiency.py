@@ -10,6 +10,7 @@ scripts, and compares each backbone/purifier with and without HiRA+RanPAC.
 import argparse
 import csv
 import json
+import os
 import sys
 import time
 from copy import deepcopy
@@ -25,6 +26,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from classifiers.hira import _attach_hira_modules, _freeze_model, _prepare_hira_model_for_eval, _seed_everything
+from classifiers.ranpac import (
+    RANPAC_CACHE_VERSION,
+    RanPACLinear,
+    ResidualRanPACLinear,
+    _find_last_linear,
+    _iter_ranpac_cache_candidate_paths,
+)
 from purifiers import PurifiedClassifier, build_purifier
 from victims import apply_victim_wrappers, build_imagenet_victim, build_wrapper_config_from_namespace, supports_hira
 from visualization.tsne_robustbench_ranpac import (
@@ -104,28 +113,212 @@ def make_variant_args(args, classifier, purifier_name, use_ours):
     return namespace
 
 
+def _load_cached_hira_if_available(model, classifier_name, wrapper_config):
+    if wrapper_config.hira_force_retrain:
+        return False
+    from classifiers.hira import HIRA_CACHE_VERSION, _build_cache_name
+
+    cache_path = os.path.join(
+        wrapper_config.hira_cache_dir,
+        _build_cache_name(
+            classifier_name=classifier_name,
+            expansion_dim=wrapper_config.hira_expansion_dim,
+            epochs=wrapper_config.hira_epochs,
+            lr=wrapper_config.hira_lr,
+            weight_decay=wrapper_config.hira_weight_decay,
+            max_train_samples=wrapper_config.hira_max_train_samples,
+            seed=wrapper_config.hira_seed,
+            num_adapter_blocks=wrapper_config.hira_num_blocks,
+            adapt_noise_eps=wrapper_config.adapt_noise_eps,
+            adapt_noise_num=wrapper_config.adapt_noise_num,
+            adapt_alpha=wrapper_config.adapt_alpha,
+            soft_threshold_alpha=wrapper_config.soft_threshold_alpha,
+            soft_threshold_beta=wrapper_config.soft_threshold_beta,
+            soft_threshold_stat_eps=wrapper_config.soft_threshold_stat_eps,
+            soft_threshold_mode=wrapper_config.soft_threshold_mode,
+            subspace_rank=wrapper_config.hira_subspace_rank,
+            subspace_shrink=wrapper_config.hira_subspace_shrink,
+            stability_ridge_gamma=wrapper_config.stability_ridge_gamma,
+            stability_ridge_stat_eps=wrapper_config.stability_ridge_stat_eps,
+        ),
+    )
+    if not os.path.exists(cache_path):
+        return False
+    state = torch.load(cache_path, map_location="cpu")
+    if state.get("version") != HIRA_CACHE_VERSION or "hira_state" not in state:
+        return False
+    model.load_state_dict(state["hira_state"], strict=False)
+    print(f"Loaded cached HiRA weights for timing: {cache_path}")
+    return True
+
+
+def _apply_hira_cache_or_random(model, classifier_name, wrapper_config, supports_hira_arch):
+    if not supports_hira_arch:
+        raise ValueError("HiRA timing is only supported for ViT-family backbones.")
+    _seed_everything(wrapper_config.hira_seed)
+    _attach_hira_modules(
+        model,
+        wrapper_config.hira_expansion_dim,
+        wrapper_config.hira_num_blocks,
+        soft_threshold_alpha=wrapper_config.soft_threshold_alpha,
+        soft_threshold_beta=wrapper_config.soft_threshold_beta,
+        soft_threshold_stat_eps=wrapper_config.soft_threshold_stat_eps,
+        soft_threshold_mode=wrapper_config.soft_threshold_mode,
+        subspace_rank=wrapper_config.hira_subspace_rank,
+        subspace_shrink=wrapper_config.hira_subspace_shrink,
+    )
+    _freeze_model(model)
+    loaded = _load_cached_hira_if_available(model, classifier_name, wrapper_config)
+    if not loaded:
+        print("HiRA cache missing for timing; using random HiRA weights and default calibration statistics.")
+    return _prepare_hira_model_for_eval(model), loaded
+
+
+def _load_cached_ranpac_state_if_available(classifier_name, wrapper_config):
+    candidate_paths = list(
+        _iter_ranpac_cache_candidate_paths(
+            cache_dir=wrapper_config.ranpac_cache_dir,
+            classifier_name=classifier_name,
+            rp_dim=wrapper_config.ranpac_rp_dim,
+            seed=wrapper_config.ranpac_seed,
+            adapt_noise_eps=wrapper_config.adapt_noise_eps,
+            adapt_noise_num=wrapper_config.adapt_noise_num,
+            adapt_alpha=wrapper_config.adapt_alpha,
+            hardneg_topk=wrapper_config.ranpac_hardneg_topk,
+            hardneg_gamma=wrapper_config.ranpac_hardneg_gamma,
+            stability_ridge_gamma=wrapper_config.stability_ridge_gamma,
+            stability_ridge_stat_eps=wrapper_config.stability_ridge_stat_eps,
+        )
+    )
+    for cache_path in candidate_paths:
+        if not os.path.exists(cache_path):
+            continue
+        state = torch.load(cache_path, map_location="cpu")
+        if state.get("version") == RANPAC_CACHE_VERSION and "weight" in state and "w_rand" in state:
+            print(f"Loaded cached RanPAC weights for timing: {cache_path}")
+            return state, True
+    return None, False
+
+
+def _random_ranpac_state(linear_layer, wrapper_config):
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(wrapper_config.ranpac_seed))
+    w_rand = torch.randn(
+        linear_layer.in_features,
+        wrapper_config.ranpac_rp_dim,
+        generator=generator,
+        dtype=torch.float32,
+    ) / max(float(linear_layer.in_features) ** 0.5, 1.0)
+    weight = torch.empty(
+        linear_layer.out_features,
+        wrapper_config.ranpac_rp_dim,
+        dtype=torch.float32,
+    )
+    torch.nn.init.kaiming_uniform_(weight, a=5 ** 0.5)
+    return {
+        "version": RANPAC_CACHE_VERSION,
+        "layer_name": None,
+        "in_features": linear_layer.in_features,
+        "out_features": linear_layer.out_features,
+        "rp_dim": wrapper_config.ranpac_rp_dim,
+        "weight": weight,
+        "w_rand": w_rand,
+    }
+
+
+def _apply_ranpac_cache_or_random(model, classifier_name, wrapper_config):
+    layer_name, linear_layer = _find_last_linear(model)
+    state, loaded = _load_cached_ranpac_state_if_available(classifier_name, wrapper_config)
+    if state is None:
+        print("RanPAC cache missing for timing; using random RanPAC head weights.")
+        state = _random_ranpac_state(linear_layer, wrapper_config)
+    elif state.get("layer_name") != layer_name:
+        print(
+            f"Cached RanPAC layer name {state.get('layer_name')} differs from current {layer_name}; "
+            "using cache anyway because dimensions match."
+        )
+    if state["in_features"] != linear_layer.in_features or state["out_features"] != linear_layer.out_features:
+        print("Cached RanPAC dimensions do not match current classifier; using random RanPAC head weights.")
+        state = _random_ranpac_state(linear_layer, wrapper_config)
+        loaded = False
+    ranpac_branch = RanPACLinear(
+        in_features=state["in_features"],
+        out_features=state["out_features"],
+        rp_dim=state["rp_dim"],
+        weight=state["weight"],
+        w_rand=state["w_rand"],
+    )
+    ranpac_head = ResidualRanPACLinear(
+        original_linear=linear_layer,
+        ranpac_linear=ranpac_branch,
+        ranpac_lambda=wrapper_config.ranpac_lambda,
+        ranpac_temp=wrapper_config.ranpac_temp,
+    )
+    parent = model
+    parts = layer_name.split(".")
+    for attr in parts[:-1]:
+        parent = getattr(parent, attr)
+    setattr(parent, parts[-1], ranpac_head)
+    return model, loaded
+
+
+def apply_wrappers_cache_or_random(classifier, classifier_name, victim_spec, wrapper_config):
+    wrapped_name = classifier_name
+    hira_loaded = None
+    ranpac_loaded = None
+    if wrapper_config.use_hira:
+        classifier, hira_loaded = _apply_hira_cache_or_random(
+            classifier,
+            classifier_name=wrapped_name,
+            wrapper_config=wrapper_config,
+            supports_hira_arch=supports_hira(victim_spec),
+        )
+        wrapped_name = f"{wrapped_name}-hira-timing"
+    if wrapper_config.use_ranpac:
+        classifier, ranpac_loaded = _apply_ranpac_cache_or_random(
+            classifier,
+            classifier_name=wrapped_name,
+            wrapper_config=wrapper_config,
+        )
+        wrapped_name = f"{wrapped_name}-ranpac-timing"
+    return classifier, wrapped_name, hira_loaded, ranpac_loaded
+
+
 def build_classifier(args, classifier_name, use_ours, device):
     classifier, base_classifier_name, victim_spec = build_imagenet_victim(classifier_name, pretrained=True)
+    wrapper_source = "none"
+    hira_cache_loaded = None
+    ranpac_cache_loaded = None
     if use_ours:
         wrapper_args = deepcopy(args)
         wrapper_args.use_hira_adapter = True
         wrapper_args.use_ranpac_head = True
         wrapper_config = build_wrapper_config_from_namespace(wrapper_args, dataset="imagenet")
-        classifier, wrapped_name = apply_victim_wrappers(
-            classifier,
-            classifier_name=base_classifier_name,
-            supports_hira_arch=supports_hira(victim_spec),
-            config=wrapper_config,
-            device=device,
-        )
+        if args.random_init_missing_wrappers:
+            classifier, wrapped_name, hira_cache_loaded, ranpac_cache_loaded = apply_wrappers_cache_or_random(
+                classifier,
+                base_classifier_name,
+                victim_spec,
+                wrapper_config,
+            )
+            wrapper_source = "cache_or_random"
+        else:
+            classifier, wrapped_name = apply_victim_wrappers(
+                classifier,
+                classifier_name=base_classifier_name,
+                supports_hira_arch=supports_hira(victim_spec),
+                config=wrapper_config,
+                device=device,
+            )
+            wrapper_source = "cache_or_fit"
     else:
         wrapped_name = base_classifier_name
-    return classifier.to(device).eval(), wrapped_name, victim_spec
+    return classifier.to(device).eval(), wrapped_name, victim_spec, wrapper_source, hira_cache_loaded, ranpac_cache_loaded
 
 
 def build_timed_model(args, classifier_name, purifier_name, use_ours, device):
     variant_args = make_variant_args(args, classifier_name, purifier_name, use_ours)
-    classifier, wrapped_name, victim_spec = build_classifier(variant_args, classifier_name, use_ours, device)
+    classifier, wrapped_name, victim_spec, wrapper_source, hira_cache_loaded, ranpac_cache_loaded = build_classifier(variant_args, classifier_name, use_ours, device)
     if purifier_name == "none":
         model = classifier
         purifier_label = "none"
@@ -133,7 +326,7 @@ def build_timed_model(args, classifier_name, purifier_name, use_ours, device):
         purifier = build_purifier(variant_args, device).to(device).eval()
         model = PurifiedClassifier(purifier, classifier).to(device).eval()
         purifier_label = purifier_name
-    return model, wrapped_name, victim_spec, purifier_label
+    return model, wrapped_name, victim_spec, purifier_label, wrapper_source, hira_cache_loaded, ranpac_cache_loaded
 
 
 def time_model(model, loader, device, args, variant_name):
@@ -219,6 +412,7 @@ def add_common_args(parser):
     parser.add_argument("--purifier-classifier", "--purifier_classifier", default="vit_base", help="Victim backbone used behind purifier pipelines.")
     parser.add_argument("--purifiers", default="mimicdiffusion,instantpure", help="Comma-separated purifier names to time with --purifier-classifier.")
     parser.add_argument("--variants", default="baseline,ours", choices=None, help="Comma-separated variants: baseline,ours.")
+    parser.add_argument("--random-init-missing-wrappers", "--random_init_missing_wrappers", type=str2bool, default=True, help="For timing only, do not fit missing HiRA/RanPAC caches; use random wrapper weights instead.")
 
 
 def add_wrapper_args(parser):
@@ -325,7 +519,15 @@ def main():
                 continue
             label = f"victim_{classifier_name}_{variant_name}"
             print(f"\nBuilding {label}...")
-            model, wrapped_name, victim_spec, purifier_label = build_timed_model(
+            (
+                model,
+                wrapped_name,
+                victim_spec,
+                purifier_label,
+                wrapper_source,
+                hira_cache_loaded,
+                ranpac_cache_loaded,
+            ) = build_timed_model(
                 args,
                 classifier_name=classifier_name,
                 purifier_name="none",
@@ -341,6 +543,9 @@ def main():
                     "wrapped_classifier": wrapped_name,
                     "victim_timm_model": victim_spec.timm_model_name,
                     "purifier": purifier_label,
+                    "wrapper_source": wrapper_source,
+                    "hira_cache_loaded": hira_cache_loaded,
+                    "ranpac_cache_loaded": ranpac_cache_loaded,
                     "batch_size": args.batch_size,
                     **metrics,
                 }
@@ -357,7 +562,15 @@ def main():
                 continue
             label = f"{purifier_name}_{args.purifier_classifier}_{variant_name}"
             print(f"\nBuilding {label}...")
-            model, wrapped_name, victim_spec, purifier_label = build_timed_model(
+            (
+                model,
+                wrapped_name,
+                victim_spec,
+                purifier_label,
+                wrapper_source,
+                hira_cache_loaded,
+                ranpac_cache_loaded,
+            ) = build_timed_model(
                 args,
                 classifier_name=args.purifier_classifier,
                 purifier_name=purifier_name,
@@ -373,6 +586,9 @@ def main():
                     "wrapped_classifier": wrapped_name,
                     "victim_timm_model": victim_spec.timm_model_name,
                     "purifier": purifier_label,
+                    "wrapper_source": wrapper_source,
+                    "hira_cache_loaded": hira_cache_loaded,
+                    "ranpac_cache_loaded": ranpac_cache_loaded,
                     "batch_size": args.purifier_batch_size,
                     **metrics,
                 }
@@ -398,6 +614,7 @@ def main():
         "purifier_batch_size": args.purifier_batch_size,
         "warmup_batches": args.warmup_batches,
         "max_batches": args.max_batches,
+        "random_init_missing_wrappers": args.random_init_missing_wrappers,
         "outputs": [
             "inference_efficiency_summary.csv",
             "inference_efficiency_batches.csv",
