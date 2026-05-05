@@ -65,7 +65,15 @@ DEFAULT_EPS = {
 }
 
 OFFICIAL_AUTOATTACK_VERSIONS = {"standard"}
-CUSTOM_AUTOATTACK_VERSIONS = {"rand", "full", "apgdt", "square"}
+CUSTOM_AUTOATTACK_VERSIONS = {"rand", "full", "apgdt", "square", "apgd-dlr", "apgd_dlr"}
+ATTACK_ALIASES = {
+    "pgd": "pgd",
+    "autoattack": "autoattack",
+    "apgd-dlr": "apgd_dlr",
+    "apgd_dlr": "apgd_dlr",
+    "apgd-cw": "apgd_cw",
+    "apgd_cw": "apgd_cw",
+}
 
 
 def str2bool(v):
@@ -160,13 +168,13 @@ def parse_args():
     parser.add_argument(
         "--attacks",
         default="pgd,autoattack",
-        help="Comma-separated list from: clean,pgd,autoattack. Clean is always reported.",
+        help="Comma-separated list from: clean,pgd,autoattack,apgd_dlr,apgd_cw. Clean is always reported.",
     )
     parser.add_argument(
         "--attack-method",
         "--attack_method",
         default="",
-        choices=["", "pgd", "autoattack", "both"],
+        choices=["", "pgd", "autoattack", "both", "apgd-dlr", "apgd_dlr", "apgd-cw", "apgd_cw"],
         help="Convenience alias for sweeps. Overrides --attacks when set.",
     )
     parser.add_argument("--eps", type=float, default=None, help="Attack epsilon. Defaults depend on dataset and norm.")
@@ -177,7 +185,7 @@ def parse_args():
         "--autoattack-version",
         "--autoattack_version",
         default="standard",
-        help="AutoAttack mode. Use 'standard' for official RobustBench benchmark(), 'full' for local APGD-CE/APGD-DLR/FAB/Square, 'rand' for local APGD-CE/APGD-DLR, 'square' for Square-only, or 'apgdt' for local APGD-T with RobustBench-standard targeted settings.",
+        help="AutoAttack mode. Use 'standard' for official RobustBench benchmark(), 'full' for local APGD-CE/APGD-DLR/FAB/Square, 'rand' for local APGD-CE/APGD-DLR, 'apgd-dlr' for APGD-DLR only, 'square' for Square-only, or 'apgdt' for local APGD-T with RobustBench-standard targeted settings.",
     )
     parser.add_argument(
         "--autoattack-eot-iter",
@@ -186,6 +194,16 @@ def parse_args():
         default=1,
         help="EOT iterations for local 'rand' AutoAttack APGD components. Official RobustBench benchmark() ignores this.",
     )
+    parser.add_argument(
+        "--autoattack-apgd-restarts",
+        "--autoattack_apgd_restarts",
+        type=int,
+        default=10,
+        help="APGD restarts for local APGD-DLR-only AutoAttack.",
+    )
+    parser.add_argument("--apgd-cw-steps", "--apgd_cw_steps", type=int, default=100, help="APGD-CW iterations.")
+    parser.add_argument("--apgd-cw-restarts", "--apgd_cw_restarts", type=int, default=5, help="APGD-CW random restarts.")
+    parser.add_argument("--apgd-cw-eot-iter", "--apgd_cw_eot_iter", type=int, default=1, help="APGD-CW EOT iterations.")
     parser.add_argument(
         "--use-hira",
         "--use_hira",
@@ -439,6 +457,117 @@ def pgd_attack(model, inputs, targets, norm, eps, steps, step_size, random_start
     return (x_orig + delta).clamp(0.0, 1.0).detach()
 
 
+def cw_margin_loss(logits, targets):
+    target_logits = logits.gather(1, targets.view(-1, 1)).squeeze(1)
+    other_logits = logits.masked_fill(F.one_hot(targets, logits.size(1)).bool(), -float("inf"))
+    max_other_logits = other_logits.max(dim=1)[0]
+    return max_other_logits - target_logits
+
+
+def initialize_delta(inputs, norm, eps):
+    if norm == ThreatModel.Linf.value:
+        delta = torch.empty_like(inputs).uniform_(-eps, eps)
+    elif norm == ThreatModel.L2.value:
+        delta = random_l2_delta(inputs, eps)
+    else:
+        raise NotImplementedError(f"Unsupported norm: {norm}")
+    return torch.clamp(inputs + delta, 0.0, 1.0) - inputs
+
+
+def normalize_l2_step(gradient):
+    return gradient / batch_l2_norm(gradient).clamp_min(1e-12)
+
+
+def apgd_oscillation_mask(loss_history, threshold=0.75):
+    if len(loss_history) < 2:
+        return torch.zeros_like(loss_history[-1], dtype=torch.bool)
+    stacked = torch.stack(loss_history, dim=0)
+    increases = (stacked[1:] > stacked[:-1]).float().sum(dim=0)
+    return increases <= threshold * (len(loss_history) - 1)
+
+
+def project_delta(delta, inputs, norm, eps):
+    if norm == ThreatModel.Linf.value:
+        delta = delta.clamp(-eps, eps)
+    elif norm == ThreatModel.L2.value:
+        delta = project_l2(delta, eps)
+    else:
+        raise NotImplementedError(f"Unsupported norm: {norm}")
+    return torch.clamp(inputs + delta, 0.0, 1.0) - inputs
+
+
+def apgd_cw_attack(model, inputs, targets, norm, eps, steps, restarts, eot_iter):
+    model.eval()
+    x_orig = inputs.detach()
+    best_adv = x_orig.clone()
+    best_success = torch.zeros(targets.size(0), dtype=torch.bool, device=targets.device)
+    best_loss = torch.full((targets.size(0),), -float("inf"), device=targets.device)
+
+    for _ in range(max(restarts, 1)):
+        delta = initialize_delta(x_orig, norm, eps)
+        step_size = 2.0 * eps * torch.ones(targets.size(0), 1, 1, 1, device=targets.device)
+        restart_best_delta = delta.clone()
+        restart_best_grad = torch.zeros_like(delta)
+        restart_best_loss = torch.full_like(best_loss, -float("inf"))
+        previous_delta = delta.clone()
+        loss_history = []
+        check_interval = max(int(0.22 * steps), 1)
+        min_interval = max(int(0.06 * steps), 1)
+
+        for iteration in range(max(steps, 1)):
+            adv = (x_orig + delta).clamp(0.0, 1.0).detach().requires_grad_(True)
+            gradient = torch.zeros_like(adv)
+            logits = None
+            loss_individual = None
+            for _ in range(max(eot_iter, 1)):
+                current_logits = model(adv)
+                current_loss_individual = cw_margin_loss(current_logits, targets)
+                current_loss = current_loss_individual.sum()
+                gradient = gradient + torch.autograd.grad(current_loss, adv, retain_graph=False)[0].detach()
+                logits = current_logits.detach()
+                loss_individual = current_loss_individual.detach()
+            gradient = gradient / float(max(eot_iter, 1))
+
+            with torch.no_grad():
+                predictions = logits.argmax(1)
+                success = predictions != targets
+                first_success = success & ~best_success
+                best_adv[first_success] = adv.detach()[first_success]
+                best_success = best_success | success
+                improved = (loss_individual > best_loss) & ~best_success
+                best_loss[improved] = loss_individual[improved]
+                best_adv[improved] = adv.detach()[improved]
+
+                restart_improved = loss_individual > restart_best_loss
+                restart_best_loss[restart_improved] = loss_individual[restart_improved]
+                restart_best_delta[restart_improved] = delta[restart_improved]
+                restart_best_grad[restart_improved] = gradient[restart_improved]
+
+                old_delta = delta.clone()
+                momentum = 0.75 if iteration > 0 else 1.0
+                if norm == ThreatModel.Linf.value:
+                    proposed_delta = delta + step_size * gradient.sign()
+                    proposed_delta = project_delta(proposed_delta, x_orig, norm, eps)
+                    delta = delta + (proposed_delta - delta) * momentum + (delta - previous_delta) * (1.0 - momentum)
+                else:
+                    proposed_delta = delta + step_size * normalize_l2_step(gradient)
+                    proposed_delta = project_delta(proposed_delta, x_orig, norm, eps)
+                    delta = delta + (proposed_delta - delta) * momentum + (delta - previous_delta) * (1.0 - momentum)
+                delta = project_delta(delta, x_orig, norm, eps)
+                previous_delta = old_delta
+
+                loss_history.append(loss_individual.clone())
+                if (iteration + 1) % check_interval == 0 and iteration + 1 < steps:
+                    oscillating = apgd_oscillation_mask(loss_history[-check_interval:])
+                    if oscillating.any():
+                        step_size[oscillating] = step_size[oscillating] / 2.0
+                        delta[oscillating] = restart_best_delta[oscillating]
+                        gradient[oscillating] = restart_best_grad[oscillating]
+                    check_interval = max(check_interval - min_interval, min_interval)
+
+    return best_adv.detach(), best_success.detach()
+
+
 def evaluate_clean(model, loader, device, desc):
     model.eval()
     correct = 0
@@ -624,7 +753,7 @@ def _compute_ranpac_diagnostics(reference_logits, variant_logits, targets, topk)
     return metrics
 
 
-def evaluate_autoattack_custom(model, loader, device, norm, eps, version, eot_iter, batch_size, desc):
+def evaluate_autoattack_custom(model, loader, device, norm, eps, version, eot_iter, apgd_restarts, batch_size, desc):
     if AutoAttack is None:
         raise ImportError("autoattack is not installed. Install it or use --autoattack_version standard.")
 
@@ -636,6 +765,9 @@ def evaluate_autoattack_custom(model, loader, device, norm, eps, version, eot_it
         adversary.attacks_to_run = ["apgd-ce", "apgd-dlr"]
         adversary.apgd.n_restarts = 1
         adversary.apgd.eot_iter = eot_iter
+    elif version in {"apgd-dlr", "apgd_dlr"}:
+        adversary.attacks_to_run = ["apgd-dlr"]
+        adversary.apgd.n_restarts = apgd_restarts
     elif version == "full":
         adversary.attacks_to_run = ["apgd-ce", "apgd-t", "fab-t", "square"]
     elif version == "square":
@@ -656,6 +788,37 @@ def evaluate_autoattack_custom(model, loader, device, norm, eps, version, eot_it
     adv_inputs = adversary.run_standard_evaluation(clean_inputs, clean_targets, bs=batch_size)
     robust_acc = _tensor_accuracy(model, adv_inputs.cpu(), clean_targets, batch_size=batch_size, device=device)
     return clean_acc, robust_acc
+
+
+def evaluate_apgd_dlr(model, loader, device, norm, eps, apgd_restarts, batch_size, desc):
+    _, robust_acc = evaluate_autoattack_custom(
+        model,
+        loader,
+        device,
+        norm=norm,
+        eps=eps,
+        version="apgd-dlr",
+        eot_iter=1,
+        apgd_restarts=apgd_restarts,
+        batch_size=batch_size,
+        desc=desc,
+    )
+    return robust_acc
+
+
+def evaluate_apgd_cw(model, loader, device, norm, eps, steps, restarts, eot_iter, desc):
+    model.eval()
+    correct = 0
+    total = 0
+    for inputs, targets in tqdm(loader, desc=desc, leave=False):
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+        adv_inputs, _ = apgd_cw_attack(model, inputs, targets, norm, eps, steps, restarts, eot_iter)
+        with torch.no_grad():
+            predictions = model(adv_inputs).argmax(1)
+        correct += (predictions == targets).sum().item()
+        total += targets.size(0)
+    return correct / max(total, 1)
 
 
 def load_robustbench_model(model_name, dataset, threat_model, model_dir, device):
@@ -691,13 +854,14 @@ def evaluate_variant(model, variant_name, benchmark_model_name, loader, attacks,
                 eps=eps,
                 version=autoattack_version,
                 eot_iter=args.autoattack_eot_iter,
+                apgd_restarts=args.autoattack_apgd_restarts,
                 batch_size=args.eval_batch_size,
                 desc=f"{variant_name} autoattack_{autoattack_version}",
             )
         else:
             raise ValueError(
                 f"Unsupported autoattack version '{args.autoattack_version}'. "
-                "Use one of: standard, full, rand, square, apgdt."
+                "Use one of: standard, full, rand, apgd-dlr, square, apgdt."
             )
         metrics["clean_acc"] = clean_acc
         metrics["autoattack_robust_acc"] = autoattack_robust_acc
@@ -715,7 +879,34 @@ def evaluate_variant(model, variant_name, benchmark_model_name, loader, attacks,
             random_start=args.pgd_random_start,
             desc=f"{variant_name} pgd",
         )
-    robust_values = [metrics[key] for key in ("pgd_robust_acc", "autoattack_robust_acc") if key in metrics]
+    if "apgd_dlr" in attacks:
+        metrics["apgd_dlr_robust_acc"] = evaluate_apgd_dlr(
+            model,
+            loader,
+            device,
+            norm=attack_threat_model,
+            eps=eps,
+            apgd_restarts=args.autoattack_apgd_restarts,
+            batch_size=args.eval_batch_size,
+            desc=f"{variant_name} apgd_dlr",
+        )
+    if "apgd_cw" in attacks:
+        metrics["apgd_cw_robust_acc"] = evaluate_apgd_cw(
+            model,
+            loader,
+            device,
+            norm=attack_threat_model,
+            eps=eps,
+            steps=args.apgd_cw_steps,
+            restarts=args.apgd_cw_restarts,
+            eot_iter=args.apgd_cw_eot_iter,
+            desc=f"{variant_name} apgd_cw",
+        )
+    robust_values = [
+        metrics[key]
+        for key in ("pgd_robust_acc", "autoattack_robust_acc", "apgd_dlr_robust_acc", "apgd_cw_robust_acc")
+        if key in metrics
+    ]
     if robust_values:
         metrics["robust_acc"] = min(robust_values)
     return metrics
@@ -726,9 +917,21 @@ def resolve_attacks(args):
         return {"pgd"}
     if args.attack_method == "autoattack":
         return {"autoattack"}
+    if args.attack_method in {"apgd-dlr", "apgd_dlr"}:
+        return {"apgd_dlr"}
+    if args.attack_method in {"apgd-cw", "apgd_cw"}:
+        return {"apgd_cw"}
     if args.attack_method == "both":
         return {"pgd", "autoattack"}
-    return {attack.strip().lower() for attack in args.attacks.split(",") if attack.strip()}
+    attacks = set()
+    for attack in args.attacks.split(","):
+        attack = attack.strip().lower()
+        if not attack or attack == "clean":
+            continue
+        if attack not in ATTACK_ALIASES:
+            raise ValueError(f"Unsupported attack '{attack}'.")
+        attacks.add(ATTACK_ALIASES[attack])
+    return attacks
 
 
 def resolve_variants(args):
@@ -947,6 +1150,11 @@ def main():
                         "eps": eps,
                         "eval_examples": eval_examples,
                         "attack_method": args.attack_method or args.attacks,
+                        "autoattack_version": args.autoattack_version,
+                        "autoattack_apgd_restarts": args.autoattack_apgd_restarts,
+                        "apgd_cw_steps": args.apgd_cw_steps,
+                        "apgd_cw_restarts": args.apgd_cw_restarts,
+                        "apgd_cw_eot_iter": args.apgd_cw_eot_iter,
                         "use_hira": variant_cfg["use_hira"],
                         "hira_num_blocks": args.hira_num_blocks if variant_cfg["use_hira"] else None,
                         "use_ranpac": variant_cfg["use_ranpac"],
