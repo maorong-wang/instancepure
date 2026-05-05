@@ -15,11 +15,13 @@ import os
 import sys
 import time
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -27,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from classifiers.hira import _attach_hira_modules, _freeze_model, _prepare_hira_model_for_eval, _seed_everything
+from classifiers.hira import HiRAAdapter, _attach_hira_modules, _freeze_model, _prepare_hira_model_for_eval, _seed_everything
 from classifiers.ranpac import (
     RANPAC_CACHE_VERSION,
     RanPACLinear,
@@ -39,6 +41,7 @@ from purifiers import PurifiedClassifier, build_purifier
 from victims import build_imagenet_victim, build_wrapper_config_from_namespace, supports_hira
 from visualization.tsne_robustbench_ranpac import (
     DATASET,
+    load_robustbench_model,
     build_imagenet_dataset,
     parse_float_or_fraction,
     resolve_device,
@@ -105,6 +108,21 @@ def build_loader(dataset, batch_size, num_workers):
     ), indices, class_ids
 
 
+@dataclass(frozen=True)
+class TimingVictimSpec:
+    requested_name: str
+    canonical_name: str
+    timm_model_name: str
+    display_name: str
+    source: str
+
+    @property
+    def classifier_name(self):
+        if self.source == "robustbench":
+            return f"{DATASET}_{self.canonical_name}"
+        return f"imagenet-{self.canonical_name.replace('_', '-')}"
+
+
 def make_variant_args(args, classifier, purifier_name, use_ours):
     namespace = SimpleNamespace(**vars(args))
     namespace.classifier = classifier
@@ -125,6 +143,53 @@ def make_variant_args(args, classifier, purifier_name, use_ours):
             )
             namespace.num_inference_step = adjusted_steps
     return namespace
+
+
+def has_hira_attach_points(model):
+    return any(name.endswith(".mlp") for name, _ in model.named_modules())
+
+
+def build_base_classifier(args, classifier_name, device):
+    source = str(args.classifier_source).lower()
+    timm_error = None
+    if source != "robustbench":
+        try:
+            classifier, base_classifier_name, victim_spec = build_imagenet_victim(classifier_name, pretrained=True)
+            timing_spec = TimingVictimSpec(
+                requested_name=victim_spec.requested_name,
+                canonical_name=victim_spec.canonical_name,
+                timm_model_name=victim_spec.timm_model_name,
+                display_name=victim_spec.display_name,
+                source="timm",
+            )
+            return classifier, base_classifier_name, timing_spec
+        except NotImplementedError as error:
+            timm_error = error
+            if source == "timm":
+                raise
+    if source in {"auto", "robustbench"}:
+        try:
+            classifier = load_robustbench_model(
+                model_name=classifier_name,
+                threat_model=args.robustbench_threat_model,
+                model_dir=args.model_dir,
+                device=device,
+            )
+        except Exception as robustbench_error:
+            raise NotImplementedError(
+                f"Could not load '{classifier_name}' as either a timm ImageNet model or a RobustBench model. "
+                f"timm error: {timm_error}; RobustBench error: {robustbench_error}"
+            ) from robustbench_error
+        base_classifier_name = f"{DATASET}_{args.robustbench_threat_model}_{classifier_name}"
+        timing_spec = TimingVictimSpec(
+            requested_name=classifier_name,
+            canonical_name=f"{args.robustbench_threat_model}_{classifier_name}",
+            timm_model_name=f"robustbench:{classifier_name}",
+            display_name=f"RobustBench {args.robustbench_threat_model} {classifier_name}",
+            source="robustbench",
+        )
+        return classifier, base_classifier_name, timing_spec
+    raise ValueError(f"Unknown classifier source: {args.classifier_source}")
 
 
 def _load_cached_hira_if_available(model, classifier_name, wrapper_config):
@@ -285,7 +350,7 @@ def apply_wrappers_cache_or_random(classifier, classifier_name, victim_spec, wra
             classifier,
             classifier_name=wrapped_name,
             wrapper_config=wrapper_config,
-            supports_hira_arch=supports_hira(victim_spec),
+            supports_hira_arch=supports_hira(victim_spec) or has_hira_attach_points(classifier),
         )
         wrapped_name = f"{wrapped_name}-hira-timing"
     if wrapper_config.use_ranpac:
@@ -299,7 +364,7 @@ def apply_wrappers_cache_or_random(classifier, classifier_name, victim_spec, wra
 
 
 def build_classifier(args, classifier_name, use_ours, device):
-    classifier, base_classifier_name, victim_spec = build_imagenet_victim(classifier_name, pretrained=True)
+    classifier, base_classifier_name, victim_spec = build_base_classifier(args, classifier_name, device)
     wrapper_source = "none"
     hira_cache_loaded = None
     ranpac_cache_loaded = None
@@ -331,6 +396,156 @@ def build_timed_model(args, classifier_name, purifier_name, use_ours, device):
         model = PurifiedClassifier(purifier, classifier).to(device).eval()
         purifier_label = purifier_name
     return model, wrapped_name, victim_spec, purifier_label, wrapper_source, hira_cache_loaded, ranpac_cache_loaded
+
+
+def _numel(value):
+    if isinstance(value, (tuple, list)):
+        return sum(_numel(item) for item in value if torch.is_tensor(item))
+    if torch.is_tensor(value):
+        return int(value.numel())
+    return 0
+
+
+def estimate_forward_flops(model, sample_inputs, device, variant_name):
+    if sample_inputs is None:
+        return {
+            "flops_estimated": False,
+            "flops_error": "no_sample_inputs",
+        }
+
+    flops = {"total": 0.0}
+    handles = []
+
+    def add(value):
+        flops["total"] += float(value)
+
+    def conv2d_hook(module, inputs, output):
+        if not inputs or not torch.is_tensor(inputs[0]) or not torch.is_tensor(output):
+            return
+        output_shape = output.shape
+        if len(output_shape) < 4:
+            return
+        batch_size = int(output_shape[0])
+        out_channels = int(output_shape[1])
+        out_h = int(output_shape[2])
+        out_w = int(output_shape[3])
+        kernel_h, kernel_w = module.kernel_size
+        in_channels_per_group = module.in_channels // module.groups
+        macs = batch_size * out_channels * out_h * out_w * kernel_h * kernel_w * in_channels_per_group
+        bias_ops = output.numel() if module.bias is not None else 0
+        add(2.0 * macs + bias_ops)
+
+    def linear_hook(module, inputs, output):
+        if not torch.is_tensor(output):
+            return
+        output_elements = int(output.numel())
+        macs = output_elements * int(module.in_features)
+        bias_ops = output_elements if module.bias is not None else 0
+        add(2.0 * macs + bias_ops)
+
+    def layernorm_hook(module, inputs, output):
+        add(5.0 * _numel(output))
+
+    def activation_hook(module, inputs, output):
+        add(float(_numel(output)))
+
+    def pooling_hook(module, inputs, output):
+        add(float(_numel(inputs[0]) if inputs and torch.is_tensor(inputs[0]) else _numel(output)))
+
+    def attention_hook(module, inputs, output):
+        if not inputs or not torch.is_tensor(inputs[0]):
+            return
+        query = inputs[0]
+        key = inputs[1] if len(inputs) > 1 and torch.is_tensor(inputs[1]) else None
+        if query.dim() == 3:
+            batch_size = int(query.shape[0])
+            query_tokens = int(query.shape[1])
+            channels = int(query.shape[2])
+        elif query.dim() == 4:
+            batch_size = int(query.shape[0])
+            channels = int(query.shape[1])
+            query_tokens = int(query.shape[2] * query.shape[3])
+        else:
+            return
+        key_tokens = query_tokens
+        if key is not None:
+            if key.dim() == 3:
+                key_tokens = int(key.shape[1])
+            elif key.dim() == 4:
+                key_tokens = int(key.shape[2] * key.shape[3])
+        attention_macs = 2 * batch_size * query_tokens * key_tokens * channels
+        add(2.0 * attention_macs)
+
+    def ranpac_hook(module, inputs, output):
+        if not inputs or not torch.is_tensor(inputs[0]):
+            return
+        batch_size = int(inputs[0].reshape(inputs[0].shape[0], -1).shape[0])
+        projection_macs = batch_size * int(module.in_features) * int(module.rp_dim)
+        head_macs = batch_size * int(module.rp_dim) * int(module.out_features)
+        gelu_ops = batch_size * int(module.rp_dim)
+        add(2.0 * (projection_macs + head_macs) + gelu_ops)
+
+    def hira_hook(module, inputs, output):
+        if not inputs or not torch.is_tensor(inputs[0]):
+            return
+        token_count = int(inputs[0].numel() // max(int(inputs[0].shape[-1]), 1))
+        in_features = int(module.b_rand.shape[0])
+        expansion_dim = int(module.b_rand.shape[1])
+        out_features = int(module.a_weight.shape[0])
+        projection_macs = token_count * in_features * expansion_dim
+        reconstruction_macs = token_count * expansion_dim * out_features
+        calibration_ops = token_count * expansion_dim
+        valid_rank = int(getattr(module, "clean_subspace_valid_rank", torch.zeros(())).item())
+        if valid_rank > 0 and float(getattr(module, "subspace_shrink", 1.0)) < 1.0:
+            calibration_ops += 4 * token_count * expansion_dim * valid_rank
+        add(2.0 * (projection_macs + reconstruction_macs) + calibration_ops)
+
+    for module in model.modules():
+        if isinstance(module, nn.Conv2d):
+            handles.append(module.register_forward_hook(conv2d_hook))
+        elif isinstance(module, nn.Linear):
+            handles.append(module.register_forward_hook(linear_hook))
+        elif isinstance(module, nn.LayerNorm):
+            handles.append(module.register_forward_hook(layernorm_hook))
+        elif isinstance(module, (nn.GELU, nn.ReLU, nn.SiLU)):
+            handles.append(module.register_forward_hook(activation_hook))
+        elif isinstance(module, (nn.AdaptiveAvgPool2d, nn.AvgPool2d, nn.MaxPool2d)):
+            handles.append(module.register_forward_hook(pooling_hook))
+        elif "attention" in module.__class__.__name__.lower():
+            handles.append(module.register_forward_hook(attention_hook))
+        elif isinstance(module, RanPACLinear):
+            handles.append(module.register_forward_hook(ranpac_hook))
+        elif isinstance(module, HiRAAdapter):
+            handles.append(module.register_forward_hook(hira_hook))
+
+    batch_size = int(sample_inputs.shape[0])
+    try:
+        model.eval()
+        reset_cuda_peak_memory(device)
+        with torch.no_grad():
+            inputs = sample_inputs.to(device, non_blocking=True)
+            synchronize(device)
+            _ = model(inputs)
+            synchronize(device)
+        total_flops = float(flops["total"])
+        return {
+            "flops_estimated": True,
+            "flops_batch_size": batch_size,
+            "forward_flops_per_batch": total_flops,
+            "forward_flops_per_sample": total_flops / max(batch_size, 1),
+            "forward_gflops_per_sample": total_flops / max(batch_size, 1) / 1e9,
+            "flops_note": "hook_estimate_conv_linear_attention_norm_activation_pool_hira_ranpac",
+        }
+    except Exception as error:
+        print(f"FLOPs estimation failed for {variant_name}: {error}")
+        return {
+            "flops_estimated": False,
+            "flops_batch_size": batch_size,
+            "flops_error": str(error),
+        }
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 def time_model(model, loader, device, args, variant_name):
@@ -402,11 +617,13 @@ def time_model(model, loader, device, args, variant_name):
 
 def add_common_args(parser):
     parser.add_argument("--data-dir", "--data_dir", default="./dataset/imagenet")
+    parser.add_argument("--model-dir", "--model_dir", default="./robustbench_models", help="RobustBench checkpoint cache directory for AT model names.")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval-examples", "--eval_examples", type=int, default=5000)
     parser.add_argument("--batch-size", "--batch_size", type=int, default=32)
     parser.add_argument("--purifier-batch-size", "--purifier_batch_size", type=int, default=1)
+    parser.add_argument("--flops-batch-size", "--flops_batch_size", type=int, default=1)
     parser.add_argument("--num-workers", "--num_workers", type=int, default=4)
     parser.add_argument("--warmup-batches", "--warmup_batches", type=int, default=2)
     parser.add_argument("--max-batches", "--max_batches", type=int, default=-1, help="Optional cap on timed batches after warmup; <=0 times all loaded samples.")
@@ -416,6 +633,9 @@ def add_common_args(parser):
     parser.add_argument("--purifier-classifier", "--purifier_classifier", default="vit_base", help="Victim backbone used behind purifier pipelines.")
     parser.add_argument("--purifiers", default="mimicdiffusion,instantpure", help="Comma-separated purifier names to time with --purifier-classifier.")
     parser.add_argument("--variants", default="baseline,ours", choices=None, help="Comma-separated variants: baseline,ours.")
+    parser.add_argument("--classifier-source", "--classifier_source", choices=["auto", "timm", "robustbench"], default="auto", help="Load classifier names from timm, RobustBench, or auto fallback.")
+    parser.add_argument("--robustbench-threat-model", "--robustbench_threat_model", choices=["Linf", "L2"], default="Linf", help="Threat model used when loading RobustBench AT classifiers.")
+    parser.add_argument("--compute-flops", "--compute_flops", type=str2bool, default=True, help="Estimate forward FLOPs with module hooks before timing.")
     parser.add_argument("--random-init-missing-wrappers", "--random_init_missing_wrappers", type=str2bool, default=True, help="Legacy no-op. Timing never fits missing HiRA/RanPAC caches and always falls back to random wrapper weights.")
 
 
@@ -512,6 +732,8 @@ def main():
 
     summary_rows = []
     all_batch_rows = []
+    flops_loader, _, _ = build_loader(dataset, args.flops_batch_size, args.num_workers)
+    flops_inputs, _ = next(iter(flops_loader))
     print(f"Saving inference-efficiency outputs to: {run_dir}")
     print(f"Loaded RobustBench-like ImageNet examples: {len(dataset)}")
     print(f"Loaded classes: {selected_class_ids}")
@@ -521,7 +743,7 @@ def main():
         for variant_name, use_ours in (("baseline", False), ("ours", True)):
             if not variant_enabled(variants, variant_name):
                 continue
-            label = f"victim_{classifier_name}_{variant_name}"
+            label = f"victim_{sanitize_name(classifier_name)}_{variant_name}"
             print(f"\nBuilding {label}...")
             (
                 model,
@@ -538,6 +760,7 @@ def main():
                 use_ours=use_ours,
                 device=device,
             )
+            flops_metrics = estimate_forward_flops(model, flops_inputs, device, label) if args.compute_flops else {"flops_estimated": False}
             metrics, batch_rows = time_model(model, loader, device, args, label)
             summary_rows.append(
                 {
@@ -546,11 +769,13 @@ def main():
                     "classifier": classifier_name,
                     "wrapped_classifier": wrapped_name,
                     "victim_timm_model": victim_spec.timm_model_name,
+                    "victim_source": victim_spec.source,
                     "purifier": purifier_label,
                     "wrapper_source": wrapper_source,
                     "hira_cache_loaded": hira_cache_loaded,
                     "ranpac_cache_loaded": ranpac_cache_loaded,
                     "batch_size": args.batch_size,
+                    **flops_metrics,
                     **metrics,
                 }
             )
@@ -564,7 +789,7 @@ def main():
         for variant_name, use_ours in (("baseline", False), ("ours", True)):
             if not variant_enabled(variants, variant_name):
                 continue
-            label = f"{purifier_name}_{args.purifier_classifier}_{variant_name}"
+            label = f"{purifier_name}_{sanitize_name(args.purifier_classifier)}_{variant_name}"
             print(f"\nBuilding {label}...")
             (
                 model,
@@ -581,6 +806,7 @@ def main():
                 use_ours=use_ours,
                 device=device,
             )
+            flops_metrics = estimate_forward_flops(model, flops_inputs, device, label) if args.compute_flops else {"flops_estimated": False}
             metrics, batch_rows = time_model(model, loader, device, args, label)
             summary_rows.append(
                 {
@@ -589,11 +815,13 @@ def main():
                     "classifier": args.purifier_classifier,
                     "wrapped_classifier": wrapped_name,
                     "victim_timm_model": victim_spec.timm_model_name,
+                    "victim_source": victim_spec.source,
                     "purifier": purifier_label,
                     "wrapper_source": wrapper_source,
                     "hira_cache_loaded": hira_cache_loaded,
                     "ranpac_cache_loaded": ranpac_cache_loaded,
                     "batch_size": args.purifier_batch_size,
+                    **flops_metrics,
                     **metrics,
                 }
             )
@@ -616,6 +844,11 @@ def main():
         "variants": sorted(variants),
         "batch_size": args.batch_size,
         "purifier_batch_size": args.purifier_batch_size,
+        "flops_batch_size": args.flops_batch_size,
+        "compute_flops": args.compute_flops,
+        "classifier_source": args.classifier_source,
+        "robustbench_threat_model": args.robustbench_threat_model,
+        "model_dir": args.model_dir,
         "warmup_batches": args.warmup_batches,
         "max_batches": args.max_batches,
         "random_init_missing_wrappers": args.random_init_missing_wrappers,
