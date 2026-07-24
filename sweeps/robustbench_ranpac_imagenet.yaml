@@ -1,6 +1,6 @@
 program: eval_robustbench_ranpac.py
 method: grid
-project: robustbench-ranpac-hira-rc-ablation_calib
+project: robustbench-ranpac-hira-rc-seed1
 name: robustbench-ranpac-hira-imagenet
 metric:
   name: robust_acc
@@ -16,10 +16,10 @@ parameters:
     value: ./robustbench_models
   model_names:
     values:
-      # - Xu2024MIMIR_Swin-L 
-      - Xu2024MIMIR_Swin-B 
-      # - Liu2023Comprehensive_Swin-L 
-      # - Liu2023Comprehensive_Swin-B 
+      # - Xu2024MIMIR_Swin-L
+      - Xu2024MIMIR_Swin-B
+      # - Liu2023Comprehensive_Swin-L
+      # - Liu2023Comprehensive_Swin-B
       - Singh2023Revisiting_ViT-B-ConvStem
       # - Singh2023Revisiting_ViT-S-ConvStem
       # - RodriguezMunoz2024Characterizing_Swin-L
@@ -29,7 +29,7 @@ parameters:
   use_ranpac:
     values: [true]
   attack_method:
-    values: [autoattack]
+    values: [pgd]
   eval_examples:
     value: 5000
   eval_split:
@@ -45,7 +45,7 @@ parameters:
   pgd_random_start:
     value: true
   autoattack_version:
-    values: [square]
+    values: [standard]
   hira_expansion_dim:
     values: [16384]
   hira_num_blocks:
@@ -61,7 +61,7 @@ parameters:
   hira_weight_decay:
     value: 0.0001
   hira_seed:
-    value: 0
+    value: 2
   hira_cache_dir:
     value: pretrained/hira_robustbench
   hira_dataset_root:
@@ -107,7 +107,7 @@ parameters:
   ranpac_cache_dir:
     value: pretrained/ranpac_robustbench
   seed:
-    value: 0
+    value: 2
   device:
     value: cuda:0
   use_wandb:

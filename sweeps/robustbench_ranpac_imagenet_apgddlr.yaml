@@ -17,13 +17,13 @@ parameters:
   model_names:
     values:
       # - Xu2024MIMIR_Swin-L
-      - Xu2024MIMIR_Swin-B
+      #- Xu2024MIMIR_Swin-B
       # - Liu2023Comprehensive_Swin-L
-      # - Liu2023Comprehensive_Swin-B
-      - Singh2023Revisiting_ViT-B-ConvStem
+      - Liu2023Comprehensive_Swin-B
+      #- Singh2023Revisiting_ViT-B-ConvStem
       # - Singh2023Revisiting_ViT-S-ConvStem
       # - RodriguezMunoz2024Characterizing_Swin-L
-      # - RodriguezMunoz2024Characterizing_Swin-B
+      - RodriguezMunoz2024Characterizing_Swin-B
   use_hira:
     values: [true]
   use_ranpac:

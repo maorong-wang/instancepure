@@ -19,11 +19,11 @@ parameters:
       - vit_base
       - vit_small
   use_hira_adapter:
-    values: [true]
+    values: [false]
   hira_expansion_dim:
     value: 16384
   use_ranpac_head:
-    values: [true]
+    values: [false]
   hira_num_blocks:
     value: 4
   hira_batch_size:

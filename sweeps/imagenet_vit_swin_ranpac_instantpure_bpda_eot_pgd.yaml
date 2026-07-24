@@ -43,6 +43,7 @@ parameters:
   classifier:
     values:
       - vit_base
+      - vit_small
   use_hira_adapter:
     values: [true]
   use_ranpac_head:
